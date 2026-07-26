@@ -39,16 +39,19 @@ method your installation normally uses):
 ./helper-scripts/mcp.sh retry
 ```
 
-`status` reports whether the profile is enabled and the service state.
+`status` validates the MCP configuration and reports whether the exact `mcp`
+profile token is enabled or disabled. It is not a live health or service-state
+probe.
 `enable` validates the configuration, records a backup, adds only the `mcp`
 profile token, pulls the pinned `ghcr.io/mailcow/mcp:0.1.0` image, initializes
 the dedicated database, starts the service, and verifies its public metadata.
 If activation fails, it restores the previous profile configuration and nginx
 state so the regular mailcow services remain independent.
 
-`disable` removes only the `mcp` token and stops the MCP-profile services. It
-does not delete the MCP database, generated secrets, OAuth state, or attachment
-volume; re-enabling is therefore reversible. `retry` is the focused recovery
+`disable` removes only the `mcp` token, stops the long-running `mcp-mailcow`
+application, and recreates nginx without MCP routes. It preserves the
+initializer, MCP database, attachment volume, generated secrets, and OAuth
+state; re-enabling is therefore reversible. `retry` is the focused recovery
 command after an MCP activation or update failure.
 
 ## Destructive cleanup
