@@ -1,5 +1,5 @@
 import { createConnection } from "mysql2/promise";
-import { GenericContainer, Wait } from "testcontainers";
+import { GenericContainer } from "testcontainers";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { initializeDatabase } from "../../src/db/init.js";
@@ -31,7 +31,6 @@ describe("MCP database bootstrap", () => {
     container = await new GenericContainer("mariadb:10.11")
       .withEnvironment({ MARIADB_ROOT_PASSWORD: rootPassword })
       .withExposedPorts(3306)
-      .withWaitStrategy(Wait.forHealthCheck())
       .start();
   }, 120_000);
 
@@ -70,9 +69,9 @@ describe("MCP database bootstrap", () => {
       );
 
       expect(schemas).toEqual([{ SCHEMA_NAME: "mailcow_mcp" }]);
-      const schemaGrants = Object.values(grants).filter((grant) =>
-        grant.includes(" ON `"),
-      );
+      const schemaGrants = grants
+        .flatMap((grant) => Object.values(grant))
+        .filter((grant) => grant.includes(" ON `"));
       expect(schemaGrants).toEqual([
         "GRANT ALL PRIVILEGES ON `mailcow_mcp`.* TO `mailcow_mcp`@`%`",
       ]);
