@@ -669,7 +669,7 @@ services:
 
     mcp-db-init:
       profiles: ["mcp"]
-      image: mailcow/mcp:test
+      image: ghcr.io/mailcow/mcp:0.1.0
       command: ["/bin/sh", "-c", "node dist/db/init.js && node dist/db/migrations.js"]
       restart: "no"
       depends_on:
@@ -687,7 +687,7 @@ services:
 
     mcp-mailcow:
       profiles: ["mcp"]
-      image: mailcow/mcp:test
+      image: ghcr.io/mailcow/mcp:0.1.0
       restart: always
       depends_on:
         mysql-mailcow:

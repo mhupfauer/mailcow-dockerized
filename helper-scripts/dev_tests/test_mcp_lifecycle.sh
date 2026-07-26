@@ -1084,8 +1084,26 @@ EOF
   pass "updater recovers core independently and distinguishes core failure"
 }
 
+test_mcp_image_release_policy() {
+  grep -q 'ghcr.io/mailcow/mcp:0.1.0' "${REPO_DIR}/docker-compose.yml" ||
+    fail "Compose does not pin the MCP image release"
+  grep -q 'linux/amd64,linux/arm64' "${REPO_DIR}/.github/workflows/mcp_release.yml" ||
+    fail "MCP release workflow does not build both supported architectures"
+  mcp_images="$(awk '
+    /^    mcp-(db-init|mailcow):/ { in_mcp_service = 1; next }
+    /^    [^[:space:]]/ { in_mcp_service = 0 }
+    in_mcp_service && /^[[:space:]]+image:/ { print }
+  ' "${REPO_DIR}/docker-compose.yml")"
+  test "$(grep -Fc 'image: ghcr.io/mailcow/mcp:0.1.0' <<< "${mcp_images}")" = 2 ||
+    fail "both MCP services do not use the pinned MCP image release"
+  ! grep -q 'image:.*latest' <<< "${mcp_images}" ||
+    fail "an MCP service uses an unpinned latest image reference"
+  pass "MCP image release policy pins Compose and publishes both architectures"
+}
+
 [[ -x "${MCP_SCRIPT}" ]] || fail "helper-scripts/mcp.sh is absent"
 
+test_mcp_image_release_policy
 test_enable_success_and_idempotence
 test_already_enabled_enable_migrates_defaults_without_side_effects
 test_enable_rolls_back_each_failure

@@ -25,6 +25,7 @@ jobs:
           - "sogo-mailcow"
           - "unbound-mailcow"
           - "watchdog-mailcow"
+          - "mcp-mailcow"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -37,6 +38,10 @@ jobs:
           cp helper-scripts/docker-compose.override.yml.d/BUILD_FLAGS/docker-compose.override.yml docker-compose.override.yml
       - name: Build Docker Images
         run: |
-          docker compose build ${image}
+          if [ "${image}" = "mcp-mailcow" ]; then
+            docker build --tag mailcow/mcp:test data/Dockerfiles/mcp
+          else
+            docker compose build ${image}
+          fi
         env:
           image: ${{ matrix.images }}
