@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS oidc_objects (
 
 CREATE TABLE IF NOT EXISTS accounts (
   id BINARY(16) NOT NULL,
-  mailbox_normalized VARCHAR(254) NOT NULL,
+  mailbox_normalized VARCHAR(254) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   credential_envelope TEXT NOT NULL,
   credential_version TINYINT UNSIGNED NOT NULL,
   created_at DATETIME(6) NOT NULL,

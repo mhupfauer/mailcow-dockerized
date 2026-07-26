@@ -17,7 +17,9 @@ export interface AccountRepository {
 
 const credentialRecordType = "mailbox-credential";
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const localPart = String.raw`(?:[A-Za-z0-9!#$%&'*+/=?^_\`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_\`{|}~-]+)*|"(?:[^"\\\r\n]|\\[^\r\n])*")`;
+const atom = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+";
+const quotedString = '"(?:[ !#-\\[\\]-~]|\\\\[ -~])+"';
+const localPart = `(?:${atom}(?:\\.${atom})*|${quotedString})`;
 const domain = String.raw`(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*`;
 const mailboxPattern = new RegExp(`^(${localPart})@(${domain})$`);
 
@@ -28,8 +30,16 @@ interface AccountRow extends RowDataPacket {
 }
 
 function normalizeMailbox(value: string): string {
-  const mailbox = value.trim();
-  const match = mailboxPattern.exec(mailbox);
+  if (
+    typeof value !== "string" ||
+    value === "" ||
+    value !== value.trim() ||
+    !/^[\x20-\x7e]+$/.test(value)
+  ) {
+    throw new Error("invalid mailbox address");
+  }
+
+  const match = mailboxPattern.exec(value);
 
   if (match === null || match[1] === undefined || match[2] === undefined) {
     throw new Error("invalid mailbox address");
@@ -37,7 +47,11 @@ function normalizeMailbox(value: string): string {
 
   const normalized = `${match[1]}@${match[2].toLowerCase()}`;
 
-  if (Buffer.byteLength(normalized, "utf8") > 254) {
+  if (
+    Buffer.byteLength(match[1], "ascii") > 64 ||
+    Buffer.byteLength(match[2], "ascii") > 253 ||
+    Buffer.byteLength(normalized, "ascii") > 254
+  ) {
     throw new Error("invalid mailbox address");
   }
 

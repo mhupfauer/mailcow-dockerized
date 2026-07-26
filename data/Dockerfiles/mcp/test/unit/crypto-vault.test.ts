@@ -120,9 +120,29 @@ describe("AesGcmCredentialVault", () => {
 
   test("rejects an unknown envelope version before attempting decryption", async () => {
     const vault = new AesGcmCredentialVault(primaryKey);
+    const envelope = await vault.seal(recordType, accountId, secretJson);
+    const [, nonce, ciphertextAndTag] = envelope.split(".");
 
     await expectGenericOpenFailure(() =>
-      vault.open(recordType, accountId, "v2.aaaaaaaaaaaaaaaa.AA"),
+      vault.open(recordType, accountId, `v2.${nonce}.${ciphertextAndTag}`),
+    );
+  });
+
+  test("rejects a noncanonical base64url payload that decodes to the same bytes", async () => {
+    const vault = new AesGcmCredentialVault(primaryKey);
+    const envelope = await vault.seal(recordType, accountId, Buffer.from("x", "utf8"));
+    const [version, nonce, ciphertextAndTag] = envelope.split(".");
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const lastCharacter = ciphertextAndTag!.at(-1)!;
+    const noncanonicalLastCharacter = alphabet[alphabet.indexOf(lastCharacter) + 1]!;
+    const noncanonicalPayload = `${ciphertextAndTag!.slice(0, -1)}${noncanonicalLastCharacter}`;
+
+    expect(ciphertextAndTag!.length % 4).toBe(3);
+    expect(Buffer.from(noncanonicalPayload, "base64url")).toEqual(
+      Buffer.from(ciphertextAndTag!, "base64url"),
+    );
+    await expectGenericOpenFailure(() =>
+      vault.open(recordType, accountId, `${version}.${nonce}.${noncanonicalPayload}`),
     );
   });
 });

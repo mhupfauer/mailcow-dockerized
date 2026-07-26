@@ -123,6 +123,29 @@ describe("MariaDbAccountRepository", () => {
     expect(rows).toEqual([{ count: 1 }]);
   });
 
+  test("keeps local-part case variants as separate credential accounts", async () => {
+    const upperCaseLocalId = await repository.upsertVerified(
+      "Case@example.test",
+      "upper-case-local-password",
+    );
+    const lowerCaseLocalId = await repository.upsertVerified(
+      "case@EXAMPLE.TEST",
+      "lower-case-local-password",
+    );
+
+    expect(lowerCaseLocalId).not.toBe(upperCaseLocalId);
+    await expect(repository.getCredential(upperCaseLocalId)).resolves.toEqual({
+      accountId: upperCaseLocalId,
+      mailbox: "Case@example.test",
+      appPassword: "upper-case-local-password",
+    });
+    await expect(repository.getCredential(lowerCaseLocalId)).resolves.toEqual({
+      accountId: lowerCaseLocalId,
+      mailbox: "case@example.test",
+      appPassword: "lower-case-local-password",
+    });
+  });
+
   test("atomically resolves concurrent reauthorizations to one account", async () => {
     const accountIds = await Promise.all(
       Array.from({ length: 8 }, (_, index) =>
@@ -169,13 +192,42 @@ describe("MariaDbAccountRepository", () => {
     await expect(repository.getCredential("not-a-uuid")).resolves.toBeNull();
   });
 
-  test("rejects mailbox lists, display names, and malformed addresses without exposing the password", async () => {
-    for (const mailbox of [
+  test("normalizes the v1 ASCII mailbox contract without changing local-part case", async () => {
+    const cases = [
+      { mailbox: "Case.Local+Folder@EXAMPLE.TEST", normalized: "Case.Local+Folder@example.test" },
+      { mailbox: '"Quoted Local"@EXAMPLE.TEST', normalized: '"Quoted Local"@example.test' },
+      { mailbox: '"Escaped\\\\Backslash"@EXAMPLE.TEST', normalized: '"Escaped\\\\Backslash"@example.test' },
+    ];
+
+    for (const { mailbox, normalized } of cases) {
+      const accountId = await repository.upsertVerified(mailbox, appPassword);
+
+      await expect(repository.getCredential(accountId)).resolves.toEqual({
+        accountId,
+        mailbox: normalized,
+        appPassword,
+      });
+    }
+  });
+
+  test("rejects ambiguous and unsupported v1 mailbox forms without exposing the password", async () => {
+    const cases = [
       "One <one@example.test>",
       "one@example.test, two@example.test",
       "missing-domain@",
       "@missing-local.example.test",
-    ]) {
+      " case@example.test",
+      "case@example.test ",
+      "two words@example.test",
+      '"control\u0001"@example.test',
+      '"line\u2028separator"@example.test',
+      "müller@example.test",
+      '"bad\\\u0001escape"@example.test',
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.test",
+      "local@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.test",
+    ];
+
+    for (const mailbox of cases) {
       let error: unknown;
 
       try {
