@@ -10,8 +10,10 @@ MCP_CONFIG_HELPER="${INSTALL_DIR}/_modules/scripts/mcp_config.sh"
 MCP_LOCK_DIR="${INSTALL_DIR}/.mcp-lifecycle.lock"
 MCP_BACKUP="${MAILCOW_CONF}.mcp.bak"
 MCP_LOCKED=n
+MCP_FINISHING=n
 MCP_TRANSACTION_ACTIVE=n
 MCP_TRANSACTION_ROLLING_BACK=n
+MCP_ROLLBACK_SIGNAL_STATUS=0
 MCP_TRANSACTION_PRIOR_APP_IDS=
 MCP_TRANSACTION_PRIOR_INIT_IDS=
 MCP_LIFECYCLE_PID=$$
@@ -32,15 +34,27 @@ mcp_cleanup_lock() {
 
 mcp_finish() {
   local status="$1"
+  local rollback_status=0
 
-  trap - EXIT INT TERM
+  MCP_FINISHING=y
+  MCP_ROLLBACK_SIGNAL_STATUS=0
+  trap 'mcp_defer_rollback_signal 130' INT
+  trap 'mcp_defer_rollback_signal 143' TERM
+  trap - EXIT
   if [[ "${MCP_TRANSACTION_ACTIVE}" == y ]]; then
-    if ! mcp_rollback_transaction; then
+    mcp_rollback_transaction || rollback_status=$?
+    if [[ "${rollback_status}" -ge 128 ]]; then
+      status="${rollback_status}"
+    elif [[ "${rollback_status}" -ne 0 ]]; then
       echo "MCP transaction rollback cleanup failed" >&2
       if [[ "${status}" -eq 0 ]]; then
         status=1
       fi
     fi
+  fi
+  trap '' INT TERM
+  if [[ "${MCP_ROLLBACK_SIGNAL_STATUS}" -ge 128 ]]; then
+    status="${MCP_ROLLBACK_SIGNAL_STATUS}"
   fi
   mcp_cleanup_lock
   exit "${status}"
@@ -221,14 +235,28 @@ mcp_recreate_nginx() {
   mcp_compose up -d --no-deps --force-recreate nginx-mailcow
 }
 
+mcp_defer_rollback_signal() {
+  local status="$1"
+
+  if [[ "${MCP_ROLLBACK_SIGNAL_STATUS}" -eq 0 ||
+        "${status}" -eq 143 ]]; then
+    MCP_ROLLBACK_SIGNAL_STATUS="${status}"
+  fi
+}
+
 mcp_rollback_transaction() {
   local rollback_failed=n
+  local signal_status
 
   if [[ "${MCP_TRANSACTION_ROLLING_BACK}" == y ]]; then
     return 1
   fi
   MCP_TRANSACTION_ROLLING_BACK=y
-  MCP_TRANSACTION_ACTIVE=n
+  if [[ "${MCP_FINISHING}" != y ]]; then
+    MCP_ROLLBACK_SIGNAL_STATUS=0
+    trap 'mcp_defer_rollback_signal 130' INT
+    trap 'mcp_defer_rollback_signal 143' TERM
+  fi
 
   if ! mcp_remove_new_containers \
     "${MCP_TRANSACTION_PRIOR_APP_IDS}" "${MCP_TRANSACTION_PRIOR_INIT_IDS}"; then
@@ -243,11 +271,21 @@ mcp_rollback_transaction() {
     rollback_failed=y
   fi
 
-  MCP_TRANSACTION_ROLLING_BACK=n
   if [[ "${rollback_failed}" == y ]]; then
     echo "MCP rollback cleanup failed; configuration/nginx restoration was still attempted" >&2
-    return 1
   fi
+
+  MCP_TRANSACTION_ROLLING_BACK=n
+  MCP_TRANSACTION_ACTIVE=n
+  if [[ "${MCP_FINISHING}" != y ]]; then
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+  signal_status="${MCP_ROLLBACK_SIGNAL_STATUS}"
+  if [[ "${signal_status}" -ne 0 ]]; then
+    return "${signal_status}"
+  fi
+  [[ "${rollback_failed}" == n ]]
 }
 
 mcp_verify_https() {
@@ -285,56 +323,51 @@ mcp_verify_https() {
   }
 
   for attempt in 1 2 3 4 5 6; do
+    : > "${authorization_body}"
+    : > "${protected_body}"
+    : > "${response_headers}"
+    challenge=
+
     status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
       --output "${authorization_body}" --write-out '%{http_code}' \
       "${issuer}/.well-known/oauth-authorization-server")" || status=000
-    if [[ "${status}" == 200 ]]; then
-      ready=y
-      break
+    if [[ "${status}" == 200 ]] &&
+      jq -e --arg issuer "${issuer}" \
+        'type == "object" and .issuer == $issuer' \
+        "${authorization_body}" >/dev/null; then
+      status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+        --output "${protected_body}" --write-out '%{http_code}' \
+        "${issuer}/.well-known/oauth-protected-resource/mcp")" || status=000
+      if [[ "${status}" == 200 ]] &&
+        jq -e --arg resource "${resource}" --arg issuer "${issuer}" \
+          'type == "object" and .resource == $resource and
+           (.authorization_servers | type == "array" and index($issuer) != null)' \
+          "${protected_body}" >/dev/null; then
+        status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+          --dump-header "${response_headers}" --output /dev/null \
+          --write-out '%{http_code}' -X POST "${resource}")" || status=000
+        if [[ "${status}" == 401 ]]; then
+          challenge="$(tr -d '\r' < "${response_headers}" |
+            awk -F': ' \
+              'tolower($1) == "www-authenticate" {
+                print substr($0, index($0, ":") + 2)
+              }' |
+            tail -1)"
+          if [[ "${challenge}" == \
+            "Bearer resource_metadata=\"${issuer}/.well-known/oauth-protected-resource/mcp\"" ]]; then
+            ready=y
+            break
+          fi
+        fi
+      fi
     fi
+
     if [[ "${attempt}" -lt 6 ]]; then
       sleep 5
     fi
   done
   if [[ "${ready}" != y ]]; then
-    echo "MCP authorization discovery did not become ready" >&2
-    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
-    return 1
-  fi
-  if ! jq -e --arg issuer "${issuer}" \
-    'type == "object" and .issuer == $issuer' "${authorization_body}" >/dev/null; then
-    echo "MCP authorization discovery returned unexpected issuer metadata" >&2
-    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
-    return 1
-  fi
-
-  status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
-    --output "${protected_body}" --write-out '%{http_code}' \
-    "${issuer}/.well-known/oauth-protected-resource/mcp")" || status=000
-  if [[ "${status}" != 200 ]] ||
-    ! jq -e --arg resource "${resource}" --arg issuer "${issuer}" \
-      'type == "object" and .resource == $resource and
-       (.authorization_servers | type == "array" and index($issuer) != null)' \
-      "${protected_body}" >/dev/null; then
-    echo "MCP protected-resource discovery returned unexpected metadata" >&2
-    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
-    return 1
-  fi
-
-  status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
-    --dump-header "${response_headers}" --output /dev/null --write-out '%{http_code}' \
-    -X POST "${resource}")" || status=000
-  if [[ "${status}" != 401 ]]; then
-    echo "MCP endpoint returned HTTP ${status}; expected 401" >&2
-    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
-    return 1
-  fi
-  challenge="$(tr -d '\r' < "${response_headers}" |
-    awk -F': ' 'tolower($1) == "www-authenticate" { print substr($0, index($0, ":") + 2) }' |
-    tail -1)"
-  if [[ "${challenge}" != \
-    "Bearer resource_metadata=\"${issuer}/.well-known/oauth-protected-resource/mcp\"" ]]; then
-    echo "MCP endpoint returned an unexpected WWW-Authenticate challenge" >&2
+    echo "MCP HTTPS discovery and authentication contract did not become ready" >&2
     rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
     return 1
   fi
@@ -357,43 +390,27 @@ mcp_enable() {
   local retry="${1:-n}"
   local prior_app_ids
   local prior_init_ids
-  local rollback_failed=n
+  local rollback_status=0
 
   mcp_require_root || return 1
   mcp_acquire_lock || return 1
   mcp_create_backup || return 1
 
-  if ! mcp_prepare_config "${MAILCOW_CONF}" upgrade; then
-    mcp_restore_backup >/dev/null 2>&1 || true
-    echo "MCP configuration preparation failed; no activation was attempted" >&2
-    return 1
-  fi
-
-  if mcp_is_enabled; then
+  if mcp_is_enabled && [[ "${retry}" != y ]]; then
     if ! mcp_validate_config "${MAILCOW_CONF}" enabled; then
-      mcp_restore_backup >/dev/null 2>&1 || true
       return 1
     fi
-    if [[ "${retry}" != y ]]; then
-      echo "MCP is already enabled"
-      return 0
-    fi
-  else
-    if ! mcp_validate_config "${MAILCOW_CONF}" disabled; then
-      mcp_restore_backup >/dev/null 2>&1 || true
-      return 1
-    fi
+    echo "MCP is already enabled"
+    return 0
   fi
 
   if ! prior_app_ids="$(mcp_container_ids mcp-mailcow 2>/dev/null)" ||
     ! mcp_validate_container_ids "${prior_app_ids}"; then
-    mcp_restore_backup >/dev/null 2>&1 || true
     echo "Could not capture the baseline MCP application container inventory" >&2
     return 1
   fi
   if ! prior_init_ids="$(mcp_container_ids mcp-db-init 2>/dev/null)" ||
     ! mcp_validate_container_ids "${prior_init_ids}"; then
-    mcp_restore_backup >/dev/null 2>&1 || true
     echo "Could not capture the baseline MCP initializer container inventory" >&2
     return 1
   fi
@@ -401,17 +418,57 @@ mcp_enable() {
   MCP_TRANSACTION_PRIOR_APP_IDS="${prior_app_ids}"
   MCP_TRANSACTION_PRIOR_INIT_IDS="${prior_init_ids}"
   MCP_TRANSACTION_ACTIVE=y
+
+  if ! mcp_prepare_config "${MAILCOW_CONF}" upgrade; then
+    mcp_rollback_transaction || rollback_status=$?
+    echo "MCP configuration preparation failed; no activation was attempted" >&2
+    if [[ "${rollback_status}" -ge 128 ]]; then
+      return "${rollback_status}"
+    fi
+    [[ "${rollback_status}" -eq 0 ]] ||
+      echo "MCP transaction rollback cleanup failed" >&2
+    return 1
+  fi
+
+  if mcp_is_enabled; then
+    if ! mcp_validate_config "${MAILCOW_CONF}" enabled; then
+      mcp_rollback_transaction || rollback_status=$?
+      if [[ "${rollback_status}" -ge 128 ]]; then
+        return "${rollback_status}"
+      fi
+      [[ "${rollback_status}" -eq 0 ]] ||
+        echo "MCP transaction rollback cleanup failed" >&2
+      return 1
+    fi
+  elif ! mcp_validate_config "${MAILCOW_CONF}" disabled; then
+    mcp_rollback_transaction || rollback_status=$?
+    if [[ "${rollback_status}" -ge 128 ]]; then
+      return "${rollback_status}"
+    fi
+    [[ "${rollback_status}" -eq 0 ]] ||
+      echo "MCP transaction rollback cleanup failed" >&2
+    return 1
+  fi
+
   if ! mcp_atomic_set_state enabled y; then
-    mcp_rollback_transaction || rollback_failed=y
+    mcp_rollback_transaction || rollback_status=$?
     echo "MCP activation failed while updating configuration; previous state restored" >&2
-    [[ "${rollback_failed}" == n ]] || echo "MCP transaction rollback cleanup failed" >&2
+    if [[ "${rollback_status}" -ge 128 ]]; then
+      return "${rollback_status}"
+    fi
+    [[ "${rollback_status}" -eq 0 ]] ||
+      echo "MCP transaction rollback cleanup failed" >&2
     return 1
   fi
 
   if ! mcp_activate; then
-    mcp_rollback_transaction || rollback_failed=y
+    mcp_rollback_transaction || rollback_status=$?
     echo "MCP activation failed; previous configuration restored" >&2
-    [[ "${rollback_failed}" == n ]] || echo "MCP transaction rollback cleanup failed" >&2
+    if [[ "${rollback_status}" -ge 128 ]]; then
+      return "${rollback_status}"
+    fi
+    [[ "${rollback_status}" -eq 0 ]] ||
+      echo "MCP transaction rollback cleanup failed" >&2
     return 1
   fi
 

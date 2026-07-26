@@ -217,6 +217,12 @@ if [[ "${url}" == *"/.well-known/oauth-authorization-server" ]]; then
   fi
   printf '200'
 elif [[ "${url}" == *"/.well-known/oauth-protected-resource/mcp" ]]; then
+  attempts="$(cat "${MCP_TEST_READINESS_COUNT}")"
+  if (( attempts <= ${MCP_TEST_PROTECTED_SLOW_ATTEMPTS:-0} )); then
+    printf '{"error":"starting"}' > "${output_file}"
+    printf '503'
+    exit 0
+  fi
   if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == protected-json ]]; then
     printf '{"resource":"https://wrong.example.test/mcp","authorization_servers":[]}' > "${output_file}"
   else
@@ -224,6 +230,12 @@ elif [[ "${url}" == *"/.well-known/oauth-protected-resource/mcp" ]]; then
   fi
   printf '200'
 else
+  attempts="$(cat "${MCP_TEST_READINESS_COUNT}")"
+  if (( attempts <= ${MCP_TEST_CHALLENGE_SLOW_ATTEMPTS:-0} )); then
+    test -n "${header_file}" && printf 'HTTP/2 503\r\n\r\n' > "${header_file}"
+    printf '503'
+    exit 0
+  fi
   if [[ -n "${header_file}" ]]; then
     if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == challenge ]]; then
       printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer\r\n\r\n' > "${header_file}"
@@ -241,8 +253,27 @@ EOF
 exit 0
 EOF
 
+  cat > "${case_dir}/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -u
+source_path="${1:-}"
+if [[ "${source_path}" == -- ]]; then
+  source_path="${2:-}"
+fi
+/bin/mv "$@"
+source_name="$(basename "${source_path}")"
+if [[ "${MCP_TEST_SIGNAL_STAGE:-}" == config-prepare &&
+      "${source_name}" == .mailcow.conf.mcp.* &&
+      "${source_name}" != .mailcow.conf.mcp-state.* &&
+      ! -e "${MCP_TEST_SIGNAL_MARKER}" ]]; then
+  : > "${MCP_TEST_SIGNAL_MARKER}"
+  kill -TERM "${MCP_LIFECYCLE_PID}"
+fi
+EOF
+
   chmod +x "${case_dir}/helper-scripts/mcp.sh" "${case_dir}/bin/id" \
-    "${case_dir}/bin/docker" "${case_dir}/bin/curl" "${case_dir}/bin/sleep"
+    "${case_dir}/bin/docker" "${case_dir}/bin/curl" "${case_dir}/bin/sleep" \
+    "${case_dir}/bin/mv"
   printf '%s\n' "${case_dir}"
 }
 
@@ -262,7 +293,10 @@ run_mcp() {
       MCP_TEST_SIGNAL_STAGE="${MCP_TEST_SIGNAL_STAGE:-}" \
       MCP_TEST_INVALID_RESPONSE="${MCP_TEST_INVALID_RESPONSE:-}" \
       MCP_TEST_SLOW_ATTEMPTS="${MCP_TEST_SLOW_ATTEMPTS:-0}" \
+      MCP_TEST_PROTECTED_SLOW_ATTEMPTS="${MCP_TEST_PROTECTED_SLOW_ATTEMPTS:-0}" \
+      MCP_TEST_CHALLENGE_SLOW_ATTEMPTS="${MCP_TEST_CHALLENGE_SLOW_ATTEMPTS:-0}" \
       MCP_TEST_READINESS_COUNT="${case_dir}/readiness-count" \
+      MCP_TEST_SIGNAL_MARKER="${case_dir}/signal-once" \
       MCP_TEST_VOLUME_STATE="${MCP_TEST_VOLUME_STATE:-present}" \
       bash "${case_dir}/helper-scripts/mcp.sh" "$@"
   )
@@ -394,6 +428,63 @@ test_term_during_activation_runs_transaction_rollback() {
   pass "TERM during an active transaction performs full rollback"
 }
 
+test_term_during_config_preparation_restores_exact_backup() {
+  local case_dir
+  local status
+  local final_nginx
+  case_dir="$(make_case signal-config-prepare)"
+  cat > "${case_dir}/mailcow.conf" <<'EOF'
+MAILCOW_HOSTNAME=mail.example.test
+COMPOSE_PROJECT_NAME=mailcowdockerized
+DBROOT=feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface
+COMPOSE_PROFILES=foo,bar
+EOF
+  chmod 600 "${case_dir}/mailcow.conf"
+  cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+  status=0
+  MCP_TEST_SIGNAL_STAGE=config-prepare run_mcp "${case_dir}" enable >/dev/null 2>&1 ||
+    status=$?
+
+  test "${status}" = 143 ||
+    fail "TERM during config preparation returned ${status}, expected 143"
+  assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+    "TERM during config preparation did not restore exact pre-migration bytes"
+  final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+  [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+    fail "config-preparation TERM did not complete disabled nginx recreation"
+  test ! -d "${case_dir}/.mcp-lifecycle.lock" ||
+    fail "config-preparation TERM left the lifecycle lock behind"
+  pass "TERM during config preparation restores backup and completes rollback"
+}
+
+test_term_during_rollback_cleanup_finishes_rollback() {
+  local case_dir
+  local status
+  local final_nginx
+  case_dir="$(make_case signal-rollback-cleanup)"
+  cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+  status=0
+  MCP_TEST_FAIL_STAGE=app MCP_TEST_SIGNAL_STAGE=remove \
+    run_mcp "${case_dir}" enable >/dev/null 2>&1 || status=$?
+
+  test "${status}" = 143 ||
+    fail "TERM during rollback cleanup returned ${status}, expected 143"
+  assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+    "TERM during rollback cleanup interrupted exact config restoration"
+  grep -q '|docker rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    "${case_dir}/calls.log" || fail "rollback cleanup TERM missed the new MCP app"
+  grep -q '|docker rm -f dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+    "${case_dir}/calls.log" || fail "rollback cleanup TERM interrupted initializer cleanup"
+  final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+  [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+    fail "rollback cleanup TERM interrupted disabled nginx recreation"
+  test ! -d "${case_dir}/.mcp-lifecycle.lock" ||
+    fail "rollback cleanup TERM left the lifecycle lock behind"
+  pass "TERM during rollback cleanup is deferred until rollback completes"
+}
+
 test_rollback_reports_inventory_and_removal_failures() {
   local stage
   local case_dir
@@ -421,6 +512,7 @@ test_rollback_reports_inventory_and_removal_failures() {
 test_https_verification_retries_and_validates_metadata() {
   local case_dir
   local invalid
+  local staged
   local final_nginx
 
   case_dir="$(make_case slow-readiness)"
@@ -429,6 +521,19 @@ test_https_verification_retries_and_validates_metadata() {
     fail "HTTPS verification did not retry bounded readiness until success"
   grep -q 'curl --connect-timeout 5 --max-time 15' "${case_dir}/calls.log" ||
     fail "HTTPS verification omitted curl connect/overall timeouts"
+
+  for staged in protected challenge; do
+    case_dir="$(make_case "staged-${staged}-readiness")"
+    if [[ "${staged}" == protected ]]; then
+      MCP_TEST_PROTECTED_SLOW_ATTEMPTS=2 run_mcp "${case_dir}" enable >/dev/null
+    else
+      MCP_TEST_CHALLENGE_SLOW_ATTEMPTS=2 run_mcp "${case_dir}" enable >/dev/null
+    fi
+    test "$(cat "${case_dir}/readiness-count")" = 3 ||
+      fail "${staged} readiness did not restart the complete HTTPS contract"
+    grep -qx 'COMPOSE_PROFILES=foo,bar,mcp' "${case_dir}/mailcow.conf" ||
+      fail "${staged} staged readiness did not complete activation"
+  done
 
   for invalid in authorization-json protected-json challenge; do
     case_dir="$(make_case "invalid-${invalid}")"
@@ -441,6 +546,8 @@ test_https_verification_retries_and_validates_metadata() {
     final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
     [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
       fail "invalid ${invalid} did not recreate disabled nginx"
+    test "$(cat "${case_dir}/readiness-count")" = 6 ||
+      fail "persistent invalid ${invalid} did not exhaust bounded full-contract attempts"
   done
   pass "HTTPS verification retries and validates discovery URLs and challenge"
 }
@@ -875,6 +982,8 @@ test_enable_rolls_back_each_failure
 test_rollback_preserves_preexisting_mcp_container
 test_baseline_inventory_failure_aborts_without_mutation
 test_term_during_activation_runs_transaction_rollback
+test_term_during_config_preparation_restores_exact_backup
+test_term_during_rollback_cleanup_finishes_rollback
 test_rollback_reports_inventory_and_removal_failures
 test_https_verification_retries_and_validates_metadata
 test_disable_is_idempotent_and_preserves_data_configuration
