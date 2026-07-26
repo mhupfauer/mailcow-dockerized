@@ -1,0 +1,42 @@
+{
+  "name": "mailcow-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "server": "node dist/server.js",
+    "db:init": "node dist/db/init.js",
+    "db:migrate": "node dist/db/migrations.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "busboy": "1.6.0",
+    "cookie-parser": "1.4.7",
+    "express": "5.2.1",
+    "express-rate-limit": "8.6.0",
+    "file-type": "22.0.1",
+    "helmet": "8.3.0",
+    "imapflow": "1.5.0",
+    "mailparser": "3.9.14",
+    "mysql2": "3.23.1",
+    "nodemailer": "9.0.3",
+    "oidc-provider": "9.10.0",
+    "pino": "10.3.1",
+    "pino-http": "11.0.0",
+    "sanitize-html": "2.17.6",
+    "yauzl": "3.4.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "@types/node": "26.1.1",
+    "@types/oidc-provider": "9.5.0",
+    "tsx": "4.23.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
