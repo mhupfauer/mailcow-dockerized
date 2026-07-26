@@ -99,6 +99,11 @@ interface ConsumedRow extends RowDataPacket {
   consumedAt: Date | null;
 }
 
+interface GrantIndexRow extends RowDataPacket {
+  model: string;
+  grantHash: string | null;
+}
+
 interface RawOidcRow extends RowDataPacket {
   model: string;
   idHash: string;
@@ -237,7 +242,7 @@ describe("MariaDbOidcAdapter", () => {
     const uid = "uid-secret-D2v7";
     const accessToken = "access-token-secret-T8m3";
     const authorizationCode = "authorization-code-secret-C9p1";
-    const adapter = MariaDbOidcAdapter.factory(pool)("Session");
+    const adapter = MariaDbOidcAdapter.factory(pool)("AccessToken");
     const payload: AdapterPayload = {
       jti: id,
       uid,
@@ -271,9 +276,9 @@ describe("MariaDbOidcAdapter", () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
-      model: "Session",
+      model: "AccessToken",
       idHash:
-        "191EA289EFD3D038C0B2BDE7EA5181A15ABAC5541B29834FBFB39D968038A7AF",
+        "D7B0080782BA91205D8336D04FC01DAF0E264E679038FE1620B7E34D450CC20A",
       grantHash:
         "4FF734730F19194B7EC7B972746C25AE94C1C75A8465B6C40C14FB5DEB4C6C39",
       userCodeHash:
@@ -378,12 +383,96 @@ describe("MariaDbOidcAdapter", () => {
     await expect(adapter.findByUid(uid)).resolves.toBeUndefined();
   });
 
-  test("revokeByGrantId transactionally removes every indexed model row for the grant and preserves unrelated rows", async () => {
+  test("findByUserCode fails closed when concurrent active IDs share one user code", async () => {
+    const userCode = "COLLISION-user-code";
+    const adapter = MariaDbOidcAdapter.factory(pool)("DeviceCode");
+
+    await Promise.all([
+      adapter.upsert(
+        "collision-device-code-1",
+        {
+          kind: "DeviceCode",
+          jti: "collision-device-code-1",
+          userCode,
+          accountId: "collision-account-1",
+        },
+        120,
+      ),
+      adapter.upsert(
+        "collision-device-code-2",
+        {
+          kind: "DeviceCode",
+          jti: "collision-device-code-2",
+          userCode,
+          accountId: "collision-account-2",
+        },
+        120,
+      ),
+    ]);
+
+    let error: unknown;
+    try {
+      await adapter.findByUserCode(userCode);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "ambiguous OIDC secondary lookup",
+    );
+    expect((error as Error).message).not.toContain(userCode);
+  });
+
+  test("findByUid fails closed when concurrent active IDs share one UID", async () => {
+    const uid = "collision-session-uid";
+    const adapter = MariaDbOidcAdapter.factory(pool)("Session");
+
+    await Promise.all([
+      adapter.upsert(
+        "collision-session-id-1",
+        {
+          kind: "Session",
+          jti: "collision-session-id-1",
+          uid,
+          accountId: "collision-account-1",
+        },
+        120,
+      ),
+      adapter.upsert(
+        "collision-session-id-2",
+        {
+          kind: "Session",
+          jti: "collision-session-id-2",
+          uid,
+          accountId: "collision-account-2",
+        },
+        120,
+      ),
+    ]);
+
+    let error: unknown;
+    try {
+      await adapter.findByUid(uid);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      "ambiguous OIDC secondary lookup",
+    );
+    expect((error as Error).message).not.toContain(uid);
+  });
+
+  test("revokeByGrantId deletes only grant-bearing model rows and preserves non-grantable rows", async () => {
     const grantId = "grant-wide-revocation-id";
     const accessToken = MariaDbOidcAdapter.factory(pool)("AccessToken");
     const authorizationCode =
       MariaDbOidcAdapter.factory(pool)("AuthorizationCode");
     const refreshToken = MariaDbOidcAdapter.factory(pool)("RefreshToken");
+    const interaction = MariaDbOidcAdapter.factory(pool)("Interaction");
+    const grant = MariaDbOidcAdapter.factory(pool)("Grant");
 
     await accessToken.upsert(
       "grant-access-token",
@@ -405,6 +494,26 @@ describe("MariaDbOidcAdapter", () => {
       { kind: "RefreshToken", grantId: "unrelated-grant-id" },
       120,
     );
+    await interaction.upsert(
+      "same-grant-interaction",
+      { kind: "Interaction", grantId, accountId: "interaction-account" },
+      120,
+    );
+    await grant.upsert(
+      "same-grant-grant-model",
+      { kind: "Grant", grantId, accountId: "grant-account" },
+      120,
+    );
+    const [nonGrantableIndexes] = await pool.query<GrantIndexRow[]>(
+      `SELECT model, HEX(grant_id) AS grantHash
+      FROM oidc_objects
+      WHERE model IN ('Interaction', 'Grant')
+      ORDER BY model`,
+    );
+    expect(nonGrantableIndexes).toEqual([
+      { model: "Grant", grantHash: null },
+      { model: "Interaction", grantHash: null },
+    ]);
 
     await accessToken.revokeByGrantId(grantId);
 
@@ -421,10 +530,20 @@ describe("MariaDbOidcAdapter", () => {
       kind: "RefreshToken",
       grantId: "unrelated-grant-id",
     });
+    await expect(interaction.find("same-grant-interaction")).resolves.toEqual({
+      kind: "Interaction",
+      grantId,
+      accountId: "interaction-account",
+    });
+    await expect(grant.find("same-grant-grant-model")).resolves.toEqual({
+      kind: "Grant",
+      grantId,
+      accountId: "grant-account",
+    });
     const [rows] = await pool.query<CountRow[]>(
       "SELECT COUNT(*) AS count FROM oidc_objects",
     );
-    expect(rows).toEqual([{ count: 1 }]);
+    expect(rows).toEqual([{ count: 3 }]);
   });
 
   test("a fresh Node process recovers rows without module-local state", async () => {

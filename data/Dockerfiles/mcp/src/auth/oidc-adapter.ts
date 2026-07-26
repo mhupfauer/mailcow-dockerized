@@ -12,6 +12,11 @@ import {
 } from "./crypto-vault.js";
 
 const maximumExpiry = "9999-12-31 23:59:59.999999";
+const grantBearingModels = new Set([
+  "AccessToken",
+  "AuthorizationCode",
+  "RefreshToken",
+]);
 
 interface StoredEnvelope {
   version: 1;
@@ -163,7 +168,11 @@ export class MariaDbOidcAdapter implements Adapter {
       typeof payload.userCode === "string" ? payload.userCode : undefined;
     const uid = typeof payload.uid === "string" ? payload.uid : undefined;
     const grantId =
-      typeof payload.grantId === "string" ? payload.grantId : undefined;
+      grantBearingModels.has(this.model) &&
+      typeof payload.grantId === "string" &&
+      payload.grantId !== ""
+        ? payload.grantId
+        : undefined;
     const storedEnvelope: StoredEnvelope = {
       version: 1,
       payload: await this.vault.seal(
@@ -259,14 +268,16 @@ export class MariaDbOidcAdapter implements Adapter {
       WHERE model = ?
         AND user_code_hash = ?
         AND expires_at > UTC_TIMESTAMP(6)
-      LIMIT 1`,
+      LIMIT 2`,
       [
         this.model,
         secondaryHash(this.lookupHashKey, "user-code", userCode),
       ],
     );
+    if (rows.length > 1) {
+      throw new Error("ambiguous OIDC secondary lookup");
+    }
     const row = rows[0];
-
     if (row === undefined || row.idHash === undefined) {
       return undefined;
     }
@@ -304,11 +315,13 @@ export class MariaDbOidcAdapter implements Adapter {
       WHERE model = ?
         AND uid_hash = ?
         AND expires_at > UTC_TIMESTAMP(6)
-      LIMIT 1`,
+      LIMIT 2`,
       [this.model, secondaryHash(this.lookupHashKey, "uid", uid)],
     );
+    if (rows.length > 1) {
+      throw new Error("ambiguous OIDC secondary lookup");
+    }
     const row = rows[0];
-
     if (row === undefined || row.idHash === undefined) {
       return undefined;
     }
