@@ -9,7 +9,9 @@ mailbox. The server supports reading and organizing mail, creating folders,
 moving messages, sending mail directly, and reading or sending attachments.
 
 The add-on runs as a sibling Compose service. It does not modify or install code
-inside an existing mailcow container.
+inside an existing mailcow container. It is delivered through tracked mailcow
+Compose and nginx templates under an opt-in `mcp` profile so both new and
+pre-existing installations receive it safely through `update.sh`.
 
 ## Goals
 
@@ -27,8 +29,13 @@ inside an existing mailcow container.
   attachments.
 - Support PDF, Excel, and other approved attachment types without routing large
   base64 payloads through model context.
-- Follow mailcow's Compose override, nginx custom include, configuration, and
-  MariaDB patterns so upgrades remain manageable.
+- Follow mailcow's tracked Compose, nginx template, configuration-migration,
+  and MariaDB patterns so upgrades remain manageable.
+- Let existing installations adopt the feature through one confirmation,
+  without manually creating secrets, editing Compose YAML, editing nginx, or
+  running SQL.
+- Keep normal mail delivery available if MCP activation or a later MCP
+  migration fails.
 
 ## Non-goals
 
@@ -41,24 +48,28 @@ inside an existing mailcow container.
 - Automatic access to arbitrary paths on a user's computer.
 - Parsing or executing attachment contents inside the MCP service.
 - Encryption-key rotation in version one.
+- Automatically enabling a new public mailbox-data endpoint during a routine
+  mailcow update.
 
 ## User Experience
 
-1. A mailbox user signs in to the mailcow UI.
-2. The user creates an app password named `Claude MCP` and enables only IMAP
+1. An administrator enables the optional service once during `update.sh` or
+   later with `./helper-scripts/mcp.sh enable`.
+2. A mailbox user signs in to the mailcow UI.
+3. The user creates an app password named `Claude MCP` and enables only IMAP
    and SMTP.
-3. The user adds `https://${MAILCOW_HOSTNAME}/mcp` as a custom connector in
+4. The user adds `https://${MAILCOW_HOSTNAME}/mcp` as a custom connector in
    Claude.
-4. Claude discovers the authorization server and starts an authorization-code
+5. Claude discovers the authorization server and starts an authorization-code
    flow with PKCE-S256.
-5. The MCP login page asks for the user's full email address and the dedicated
+6. The MCP login page asks for the user's full email address and the dedicated
    app password.
-6. The service verifies the credentials against both IMAP and SMTP, then shows
+7. The service verifies the credentials against both IMAP and SMTP, then shows
    consent for `mail.read`, `mail.send`, and `mail.organize`.
-7. After consent, Claude receives opaque access and refresh tokens. Claude
+8. After consent, Claude receives opaque access and refresh tokens. Claude
    never receives the app password.
-8. MCP calls use the token subject to select the credential and mailbox.
-9. Revoking the app password in mailcow causes subsequent mailbox operations
+9. MCP calls use the token subject to select the credential and mailbox.
+10. Revoking the app password in mailcow causes subsequent mailbox operations
    to require reauthentication.
 
 ## Architecture
@@ -91,9 +102,11 @@ mailcow nginx on https://${MAILCOW_HOSTNAME}
        `-- dovecot-mailcow / postfix-mailcow
 ```
 
-The service is attached to `mailcow-network`. Its Node.js port is not published
-to the host. Mailcow nginx terminates TLS and proxies only the documented
-routes.
+The service is declared in the tracked base Compose file under the optional
+`mcp` profile and is attached to `mailcow-network`. Its Node.js port is not
+published to the host. Mailcow nginx terminates TLS and proxies only the
+documented routes. The tracked nginx template renders those routes only when
+the exact `mcp` profile token is enabled.
 
 ## Public Routes
 
@@ -228,15 +241,23 @@ The master encryption key is configured through mailcow's existing
 MCP_ENCRYPTION_KEY=<64 lowercase or uppercase hexadecimal characters>
 ```
 
-Generate it with:
+New installations and the first MCP-aware update generate this value
+automatically with a cryptographically secure random source. The equivalent
+manual recovery command is:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Startup fails if the key is absent or does not decode to exactly 32 bytes. The
-key is never stored in MariaDB or logs. Mailcow already restricts
-`mailcow.conf` to mode `0600`; operators must preserve that permission.
+When MCP is enabled, startup and update preflight fail if the key is absent or
+does not decode to exactly 32 bytes. A disabled installation reports the
+problem but may continue a core-only mailcow update. Once
+`MCP_CONFIG_VERSION` exists, update code never silently regenerates a missing
+or invalid key because doing so would make existing encrypted data unreadable.
+It instructs the operator to restore the `mailcow.conf` backup or use an
+explicit future credential-reset procedure. The key is never stored in MariaDB
+or logs. Mailcow already restricts `mailcow.conf` to mode `0600`; all automated
+edits preserve that permission.
 
 App passwords, staged attachment bytes, and private signing-key material are
 encrypted with AES-256-GCM. Every encrypted object uses a fresh random 96-bit
@@ -483,10 +504,13 @@ The implementation adds these options to mailcow's configuration generation
 and update mechanism:
 
 ```env
+COMPOSE_PROFILES=
+MCP_CONFIG_VERSION=1
+MCP_UPDATE_OFFERED=1
 MCP_DBNAME=mailcow_mcp
 MCP_DBUSER=mailcow_mcp
-MCP_DBPASS=
-MCP_ENCRYPTION_KEY=
+MCP_DBPASS=<automatically-generated-64-character-hex-secret>
+MCP_ENCRYPTION_KEY=<automatically-generated-64-character-hex-key>
 MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback
 MCP_ATTACHMENT_MAX_BYTES=10485760
 MCP_MESSAGE_MAX_BYTES=26214400
@@ -503,20 +527,157 @@ MCP_CONCURRENT_UPLOADS=5
 MCP_AUDIT_RETENTION_DAYS=30
 ```
 
-Empty database password or encryption key is a startup error. Installation
-documentation provides cryptographically secure generation commands.
+`COMPOSE_PROFILES` is the source of truth for enablement. The feature is active
+only when the value contains `mcp` as an exact comma-separated token. The
+helper appends or removes only that token and preserves any unrelated profiles.
+Mailcow scripts unset an inherited shell-level `COMPOSE_PROFILES` before
+invoking Compose so it cannot override the value in `.env`/`mailcow.conf`.
+
+`MCP_CONFIG_VERSION=1` distinguishes a configuration that has already received
+MCP secrets from an older installation. On a new installation,
+`generate_config.sh` writes all MCP defaults and cryptographically secure
+secrets but leaves `mcp` out of `COMPOSE_PROFILES`. On the first MCP-aware
+update of an existing installation, `adapt_new_options` generates a 32-byte
+hexadecimal `MCP_DBPASS`, generates the 32-byte hexadecimal
+`MCP_ENCRYPTION_KEY`, and writes the version marker last. It builds the new
+configuration in a temporary file and atomically replaces `mailcow.conf`, so a
+partial write cannot leave the marker without its secrets. Neither secret is
+printed. Re-running the migration is idempotent and preserves existing values.
+
+`MCP_UPDATE_OFFERED` records the one-time adoption decision independently of
+the configuration version. New installations write it as `1`. A pre-existing
+installation initially receives `0`; the first successful MCP-aware update
+sets it to `1` after asking the interactive question, or after printing the
+manual opt-in command in unattended or `--skip-start` mode.
+
+An empty or invalid database password or encryption key is an MCP enablement
+and startup error. It aborts an enabled installation's update preflight before
+core services are stopped; on a disabled installation it is reported without
+blocking the core update. After the version marker exists, automation must not
+replace either credential. Installation documentation includes secure
+commands only for explicit recovery or reset procedures.
+
+## Existing Installations, Update, and Activation
+
+The feature is shipped to old and new installations through tracked repository
+files. It does not depend on `docker-compose.override.yml`,
+`data/conf/nginx/*.custom`, or another ignored local file, because `update.sh`
+cannot reliably add or maintain those files.
+
+The repository changes are explicit:
+
+- `generate_config.sh` defines defaults and first-install secrets.
+- `_modules/scripts/new_options.sh` migrates existing configurations.
+- `docker-compose.yml` declares the profiled services and volume.
+- `data/Dockerfiles/nginx/bootstrap.py` parses the exact profile token for the
+  template context.
+- `data/conf/nginx/templates/sites-default.conf.j2` contains the conditional
+  routes.
+- `helper-scripts/mcp.sh` owns enable, disable, status, retry, and purge.
+- `update.sh` adds preflight, post-merge validation, the one-time offer, and
+  MCP-specific result reporting.
+
+### First MCP-aware update
+
+The normal configuration migration runs before activation:
+
+1. Mailcow's existing `_modules` self-refresh/restart behavior loads the new
+   migration code; rerunning `update.sh` after that standard restart requires
+   no MCP-specific preparation.
+2. The refreshed update module detects the missing `MCP_CONFIG_VERSION` before
+   the first Compose validation or container shutdown.
+3. It backs up `mailcow.conf`, atomically adds the two MCP secrets without
+   displaying them, appends the MCP defaults, sets `MCP_UPDATE_OFFERED=0`, and
+   writes the configuration marker last while preserving mode `0600`.
+4. The update merges the tracked Compose services, database initializer,
+   helper script, and conditional nginx template.
+5. Core mailcow services are updated and started independently of MCP.
+6. After the core stack starts, an interactive update with
+   `MCP_UPDATE_OFFERED=0` asks once whether to enable the MCP service now. The
+   default answer is no.
+7. A yes answer invokes `./helper-scripts/mcp.sh enable`; a no answer leaves a
+   ready but disabled configuration and prints that command for later use.
+   Either answer atomically records `MCP_UPDATE_OFFERED=1`.
+
+`update.sh --force` and other non-interactive execution never enable a
+previously disabled installation and never expose the new routes. They
+generate the required configuration values, leave `COMPOSE_PROFILES`
+unchanged, record that the offer was handled, and print the opt-in command in
+the update summary. `--skip-start` behaves the same way because activation
+cannot be verified while the core stack is intentionally stopped.
+
+### Transactional enable
+
+`./helper-scripts/mcp.sh enable` performs one administrator-facing operation:
+
+1. Verify privileges, acquire a dedicated lock, and create a mode-`0600`
+   backup of `mailcow.conf`.
+2. Generate secrets only for a genuinely pre-marker configuration. If the
+   marker already exists and a secret is missing or invalid, stop and direct
+   the administrator to recovery instead of replacing it.
+3. Atomically add the exact `mcp` token to `COMPOSE_PROFILES`, preserve other
+   profile tokens, and record `MCP_UPDATE_OFFERED=1`.
+4. Run `docker compose --profile mcp config -q`.
+5. Pull the pinned prebuilt MCP image from the mailcow GHCR namespace.
+6. Ensure MariaDB is available, run the idempotent database initializer, and
+   run schema migrations with the restricted MCP database user.
+7. Start the MCP application and recreate or reload nginx so the conditional
+   public routes become active.
+8. Verify OAuth discovery and verify that an unauthenticated `/mcp` request
+   returns the expected `401` response and protected-resource metadata.
+
+If any step fails, the helper stops and removes the MCP application, restores
+the previous configuration/profile state, and recreates nginx without the MCP
+routes. Database objects created before failure may remain for diagnosis and a
+later retry, but no core mail service depends on them. Activation failure
+therefore cannot take SMTP, IMAP, or the normal mailcow UI offline.
+
+### Later updates
+
+An update treats an exact `mcp` token in `COMPOSE_PROFILES` as an already
+enabled installation. Before stopping services it validates the configuration
+marker, database password, encryption-key format, and profile syntax. After
+the repository merge it runs `docker compose config -q` again so newly shipped
+Compose content is validated, not merely the pre-update file.
+
+The normal image pull and `compose up` include the active profile, run
+idempotent initialization and schema migration, and health-check the MCP
+service. Existing secrets, database contents, OAuth grants, and enabled state
+are preserved. MCP services remain dependency leaves: a failed MCP pull,
+migration, or health check is reported prominently, but core mail services are
+still brought up. The update summary gives a focused recovery or retry command.
+
+### Disable and purge
+
+`./helper-scripts/mcp.sh disable` atomically removes only the `mcp` profile
+token, stops MCP-profile services, and recreates nginx without public MCP
+routes. It preserves the MCP database, database credentials, encryption key,
+OAuth state, and temporary attachment volume so re-enabling is reversible.
+
+Permanent cleanup is a distinct `./helper-scripts/mcp.sh purge` operation with
+an explicit destructive confirmation. Purge removes the dedicated database
+and temporary volume only after the service is disabled; it is never called by
+`update.sh` or ordinary disable. Existing mailbox data is outside its scope.
 
 ## Compose and Nginx Integration
 
-- A root `docker-compose.override.yml` adds the one-shot database initializer
-  and `mcp-mailcow` service.
-- The application image is built from pinned source and a pinned Node.js base
-  image.
+- The tracked base `docker-compose.yml` declares the one-shot database
+  initializer and `mcp-mailcow` service under the optional `mcp` profile.
+- The application uses a version-pinned, prebuilt image from the mailcow GHCR
+  namespace. Operators do not need Node.js or a local image build.
 - Only nginx can reach the application HTTP port through `mailcow-network`.
 - The MCP service can reach `mysql-mailcow`, `dovecot-mailcow`, and
   `postfix-mailcow`.
-- A custom nginx include proxies only the documented routes and sets explicit
-  request-body, streaming, and timeout limits.
+- The tracked nginx templates conditionally proxy only the documented routes
+  when the exact `mcp` profile token is active, and set explicit request-body,
+  streaming, and timeout limits.
+- Nginx receives the profile value as template input; disabled installations
+  render no MCP location blocks and expose no discovery, OAuth, login, upload,
+  or MCP endpoint.
+- Enabled templates use Docker DNS resolution at request time rather than a
+  startup-resolved static upstream. An absent or unhealthy MCP container can
+  therefore produce an MCP-route `502` but cannot prevent nginx from serving
+  the mailcow UI and other routes.
 - The Streamable HTTP route disables proxy buffering where streaming requires
   it.
 - The upload route has a request-body limit consistent with
@@ -525,6 +686,9 @@ documentation provides cryptographically secure generation commands.
 - Container health checks use an internal liveness/readiness route that
   exposes no credentials or configuration.
 - Schema migration and database readiness precede application readiness.
+- The database initializer alone receives `DBROOT`; the long-running service
+  receives only its dedicated database credentials.
+- No core mailcow service depends on an MCP-profile service.
 - Dependencies and the container image are pinned and covered by the existing
   update workflow rather than using `latest`.
 
@@ -583,11 +747,43 @@ documentation provides cryptographically secure generation commands.
 - Manual Claude custom-connector registration, login, consent, refresh,
   mailbox operations, attachment upload, and disconnect/revocation.
 
+### Installation and update tests
+
+- Migrate a representative pre-MCP `mailcow.conf`, generating both secrets and
+  the marker without changing existing options or file mode.
+- Re-run configuration migration and prove the generated secrets and enabled
+  state remain byte-for-byte unchanged.
+- Fail closed when a marked configuration has a missing or malformed key or
+  database password.
+- Enable and disable repeatedly while preserving unrelated
+  `COMPOSE_PROFILES` tokens.
+- Verify interactive yes/no behavior and prove `update.sh --force` never
+  enables MCP on a previously disabled installation.
+- Verify the one-time offer marker for new installs, interactive yes/no,
+  `--force`, interrupted updates, and `--skip-start`.
+- Inject failures at Compose validation, image pull, database initialization,
+  schema migration, application startup, nginx activation, and health
+  verification; each must roll back routes/profile state and leave core mail
+  services available.
+- Update an already enabled installation and verify its database, key, grants,
+  profile, and endpoint survive.
+- Verify disable preserves state and purge requires a separate confirmation.
+- Validate both the pre-merge and post-merge Compose configurations.
+
 ## Rollout
 
-Version one is enabled only when all required MCP configuration values exist.
-The normal mailcow stack remains functional when the override is absent or the
-MCP service is stopped. Rollback consists of removing or disabling the
-override and nginx include; it does not change mailcow mailbox data. The
-dedicated MCP database and encrypted temporary attachment volume can be
-retained for recovery or removed separately after an operator backup.
+Version one ships disabled to both new and pre-existing installations. Presence
+of generated configuration does not expose an endpoint; only the active `mcp`
+profile does. Interactive updates offer the transactional enable helper once,
+while forced or unattended updates remain opt-in.
+
+The existing physical MariaDB-volume backup includes the dedicated MCP
+database. Operators must also back up `mailcow.conf`, because encrypted MCP
+records cannot be recovered without `MCP_ENCRYPTION_KEY`. Temporary staged
+attachments are deliberately ephemeral and excluded from durable backup
+expectations.
+
+Rollback uses the disable helper and does not modify mailbox data. The
+dedicated database, credentials, encryption key, OAuth state, and temporary
+volume remain available for recovery or re-enable. Destructive cleanup is
+reserved for the separately confirmed purge operation.
