@@ -121,6 +121,39 @@ mcp_validate_config() {
     echo "MCP is disabled but COMPOSE_PROFILES contains mcp" >&2
     return 1
   fi
+
+  local default_key
+  local -a default_keys=(
+    MCP_UPDATE_OFFERED
+    MCP_DBNAME
+    MCP_DBUSER
+    MCP_OAUTH_ALLOWED_REDIRECT_URIS
+    MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS
+    MCP_ATTACHMENT_MAX_BYTES
+    MCP_MESSAGE_MAX_BYTES
+    MCP_BASE64_UPLOAD_MAX_BYTES
+    MCP_UPLOAD_TTL_SECONDS
+    MCP_ATTACHMENT_ALLOWED_TYPES
+    MCP_LOGIN_ATTEMPTS
+    MCP_LOGIN_WINDOW_SECONDS
+    MCP_REGISTRATIONS_PER_HOUR
+    MCP_REQUESTS_PER_MINUTE
+    MCP_SENDS_PER_MINUTE
+    MCP_RECIPIENTS_PER_HOUR
+    MCP_CONCURRENT_UPLOADS
+    MCP_AUDIT_RETENTION_DAYS
+  )
+  for default_key in "${default_keys[@]}"; do
+    mcp_config_value "${config_path}" "${default_key}" >/dev/null || {
+      echo "${default_key} must be set exactly once" >&2
+      return 1
+    }
+  done
+
+  [[ "$(mcp_config_value "${config_path}" MCP_UPDATE_OFFERED)" =~ ^[01]$ ]] || {
+    echo "MCP_UPDATE_OFFERED must be 0 or 1" >&2
+    return 1
+  }
 }
 
 mcp_append_if_missing() {
@@ -131,6 +164,31 @@ mcp_append_if_missing() {
   mcp_config_has_key "${config_path}" "${key}" || printf '%s=%s\n' "${key}" "${value}" >> "${config_path}"
 }
 
+mcp_append_defaults() {
+  local config_path="$1"
+  local install_type="$2"
+
+  mcp_append_if_missing "${config_path}" COMPOSE_PROFILES ""
+  mcp_append_if_missing "${config_path}" MCP_UPDATE_OFFERED "$([[ "${install_type}" == "new" ]] && printf 1 || printf 0)"
+  mcp_append_if_missing "${config_path}" MCP_DBNAME mailcow_mcp
+  mcp_append_if_missing "${config_path}" MCP_DBUSER mailcow_mcp
+  mcp_append_if_missing "${config_path}" MCP_OAUTH_ALLOWED_REDIRECT_URIS 'https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback'
+  mcp_append_if_missing "${config_path}" MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS 1
+  mcp_append_if_missing "${config_path}" MCP_ATTACHMENT_MAX_BYTES 10485760
+  mcp_append_if_missing "${config_path}" MCP_MESSAGE_MAX_BYTES 26214400
+  mcp_append_if_missing "${config_path}" MCP_BASE64_UPLOAD_MAX_BYTES 1048576
+  mcp_append_if_missing "${config_path}" MCP_UPLOAD_TTL_SECONDS 3600
+  mcp_append_if_missing "${config_path}" MCP_ATTACHMENT_ALLOWED_TYPES pdf,xlsx,csv,txt,png,jpg,jpeg
+  mcp_append_if_missing "${config_path}" MCP_LOGIN_ATTEMPTS 5
+  mcp_append_if_missing "${config_path}" MCP_LOGIN_WINDOW_SECONDS 900
+  mcp_append_if_missing "${config_path}" MCP_REGISTRATIONS_PER_HOUR 10
+  mcp_append_if_missing "${config_path}" MCP_REQUESTS_PER_MINUTE 120
+  mcp_append_if_missing "${config_path}" MCP_SENDS_PER_MINUTE 10
+  mcp_append_if_missing "${config_path}" MCP_RECIPIENTS_PER_HOUR 100
+  mcp_append_if_missing "${config_path}" MCP_CONCURRENT_UPLOADS 5
+  mcp_append_if_missing "${config_path}" MCP_AUDIT_RETENTION_DAYS 30
+}
+
 mcp_prepare_config() {
   local config_path="$1"
   local install_type="$2"
@@ -138,6 +196,7 @@ mcp_prepare_config() {
   local config_name
   local profiles
   local validation_state
+  local config_versioned=n
 
   [[ -f "${config_path}" ]] || {
     echo "MCP configuration file is missing" >&2
@@ -148,67 +207,39 @@ mcp_prepare_config() {
     return 1
   }
 
-  if mcp_config_has_key "${config_path}" MCP_CONFIG_VERSION; then
-    profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES)" || {
-      echo "COMPOSE_PROFILES must be set exactly once" >&2
-      return 1
-    }
-    if mcp_profile_contains "${profiles}" mcp; then
-      validation_state=enabled
-    else
-      validation_state=disabled
-    fi
-    mcp_validate_config "${config_path}" "${validation_state}" || return 1
-    chmod 600 "${config_path}"
-    return
-  fi
+  mcp_config_has_key "${config_path}" MCP_CONFIG_VERSION && config_versioned=y
 
   config_dir="$(dirname "${config_path}")"
   config_name="$(basename "${config_path}")"
 
   (
     local temp_config
+    local temp_config_escaped
     local generated_secret
 
     umask 077
     temp_config="$(mktemp "${config_dir}/.${config_name}.mcp.XXXXXX")" || exit 1
-    trap 'rm -f "${temp_config}"' EXIT
+    printf -v temp_config_escaped '%q' "${temp_config}"
+    trap "rm -f -- ${temp_config_escaped}" EXIT
     cp "${config_path}" "${temp_config}" || exit 1
 
-    mcp_append_if_missing "${temp_config}" COMPOSE_PROFILES ""
-    mcp_append_if_missing "${temp_config}" MCP_UPDATE_OFFERED "$([[ "${install_type}" == "new" ]] && printf 1 || printf 0)"
-    mcp_append_if_missing "${temp_config}" MCP_DBNAME mailcow_mcp
-    mcp_append_if_missing "${temp_config}" MCP_DBUSER mailcow_mcp
-    mcp_append_if_missing "${temp_config}" MCP_OAUTH_ALLOWED_REDIRECT_URIS 'https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback'
-    mcp_append_if_missing "${temp_config}" MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS 1
-    mcp_append_if_missing "${temp_config}" MCP_ATTACHMENT_MAX_BYTES 10485760
-    mcp_append_if_missing "${temp_config}" MCP_MESSAGE_MAX_BYTES 26214400
-    mcp_append_if_missing "${temp_config}" MCP_BASE64_UPLOAD_MAX_BYTES 1048576
-    mcp_append_if_missing "${temp_config}" MCP_UPLOAD_TTL_SECONDS 3600
-    mcp_append_if_missing "${temp_config}" MCP_ATTACHMENT_ALLOWED_TYPES pdf,xlsx,csv,txt,png,jpg,jpeg
-    mcp_append_if_missing "${temp_config}" MCP_LOGIN_ATTEMPTS 5
-    mcp_append_if_missing "${temp_config}" MCP_LOGIN_WINDOW_SECONDS 900
-    mcp_append_if_missing "${temp_config}" MCP_REGISTRATIONS_PER_HOUR 10
-    mcp_append_if_missing "${temp_config}" MCP_REQUESTS_PER_MINUTE 120
-    mcp_append_if_missing "${temp_config}" MCP_SENDS_PER_MINUTE 10
-    mcp_append_if_missing "${temp_config}" MCP_RECIPIENTS_PER_HOUR 100
-    mcp_append_if_missing "${temp_config}" MCP_CONCURRENT_UPLOADS 5
-    mcp_append_if_missing "${temp_config}" MCP_AUDIT_RETENTION_DAYS 30
+    mcp_append_defaults "${temp_config}" "${install_type}"
 
-    if mcp_config_has_key "${temp_config}" MCP_DBPASS; then
-      mcp_config_value "${temp_config}" MCP_DBPASS >/dev/null || exit 1
-    else
-      generated_secret="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-      printf 'MCP_DBPASS=%s\n' "${generated_secret}" >> "${temp_config}"
+    if [[ "${config_versioned}" == n ]]; then
+      if mcp_config_has_key "${temp_config}" MCP_DBPASS; then
+        mcp_config_value "${temp_config}" MCP_DBPASS >/dev/null || exit 1
+      else
+        generated_secret="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+        printf 'MCP_DBPASS=%s\n' "${generated_secret}" >> "${temp_config}"
+      fi
+      if mcp_config_has_key "${temp_config}" MCP_ENCRYPTION_KEY; then
+        mcp_config_value "${temp_config}" MCP_ENCRYPTION_KEY >/dev/null || exit 1
+      else
+        generated_secret="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+        printf 'MCP_ENCRYPTION_KEY=%s\n' "${generated_secret}" >> "${temp_config}"
+      fi
+      printf 'MCP_CONFIG_VERSION=1\n' >> "${temp_config}"
     fi
-    if mcp_config_has_key "${temp_config}" MCP_ENCRYPTION_KEY; then
-      mcp_config_value "${temp_config}" MCP_ENCRYPTION_KEY >/dev/null || exit 1
-    else
-      generated_secret="$(LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-      printf 'MCP_ENCRYPTION_KEY=%s\n' "${generated_secret}" >> "${temp_config}"
-    fi
-
-    printf 'MCP_CONFIG_VERSION=1\n' >> "${temp_config}"
     chmod 600 "${temp_config}" || exit 1
     profiles="$(mcp_config_value "${temp_config}" COMPOSE_PROFILES)" || exit 1
     if mcp_profile_contains "${profiles}" mcp; then

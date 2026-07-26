@@ -406,7 +406,7 @@ configure_ipv6
 
 [[ -f data/conf/nginx/ZZZ-ejabberd.conf ]] && rm data/conf/nginx/ZZZ-ejabberd.conf
 migrate_config_options
-adapt_new_options
+adapt_new_options || exit 1
 
 if [ ! "$DEV" ]; then
   DEFAULT_REPO="https://github.com/mailcow/mailcow-dockerized"
