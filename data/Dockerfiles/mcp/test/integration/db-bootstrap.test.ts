@@ -39,7 +39,7 @@ describe("MCP database bootstrap", () => {
     await container?.stop();
   });
 
-  test("creates an idempotent dedicated schema, user, and initial migration", async () => {
+  test("creates an idempotent dedicated schema, user, and migrations", async () => {
     const host = container.getHost();
     const port = container.getMappedPort(3306);
     const bootstrapConfig = {
@@ -109,7 +109,7 @@ describe("MCP database bootstrap", () => {
         "SELECT version FROM schema_migrations",
       );
 
-      expect(migrations).toEqual([{ version: 1 }]);
+      expect(migrations).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       await pool.end();
     }
@@ -210,7 +210,7 @@ describe("MCP database bootstrap", () => {
       const [migrations] = await pool.query<{ version: number }[]>(
         "SELECT version FROM schema_migrations",
       );
-      expect(migrations).toEqual([{ version: 1 }]);
+      expect(migrations).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       await pool.end();
     }
@@ -276,7 +276,7 @@ describe("MCP database bootstrap", () => {
       const [migrations] = await firstPool.query<{ version: number }[]>(
         "SELECT version FROM schema_migrations",
       );
-      expect(migrations).toEqual([{ version: 1 }]);
+      expect(migrations).toEqual([{ version: 1 }, { version: 2 }]);
     } finally {
       await lockConnection.query("SELECT RELEASE_LOCK(?)", [migrationLockName]);
       await Promise.all([firstPool.end(), secondPool.end()]);

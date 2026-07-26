@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { Pool, RowDataPacket } from "mysql2/promise";
 import { createPool } from "./pool.js";
@@ -8,8 +8,18 @@ interface Migration {
   filename: string;
 }
 
-const migrations: Migration[] = [{ version: 1, filename: "001_initial.sql" }];
 const migrationLockName = "mailcow_mcp_migrations";
+
+async function discoverMigrations(): Promise<Migration[]> {
+  const files = await readdir(new URL("./migrations/", import.meta.url));
+  const migrations = files.flatMap((filename): Migration[] => {
+    const match = /^(\d+)_[-a-z0-9]+\.sql$/i.exec(filename);
+
+    return match === null ? [] : [{ version: Number(match[1]), filename }];
+  });
+
+  return migrations.sort((left, right) => left.version - right.version);
+}
 
 async function loadMigration(filename: string): Promise<string> {
   return readFile(new URL(`./migrations/${filename}`, import.meta.url), "utf8");
@@ -44,6 +54,18 @@ export async function runMigrations(pool: Pool): Promise<void> {
       }
     }
 
+    const migrations = await discoverMigrations();
+    const discoveredVersions = new Set<number>();
+
+    for (const migration of migrations) {
+      if (discoveredVersions.has(migration.version)) {
+        throw new Error(
+          `duplicate MCP database migration version: ${migration.version}`,
+        );
+      }
+      discoveredVersions.add(migration.version);
+    }
+
     for (const migration of migrations) {
       if (applied.has(migration.version)) {
         continue;
@@ -59,8 +81,8 @@ export async function runMigrations(pool: Pool): Promise<void> {
       }
 
       // MariaDB DDL auto-commits. Migrations must therefore be replay-safe if
-      // a process stops after DDL but before this version record; 001 uses
-      // CREATE TABLE IF NOT EXISTS. The lock prevents concurrent replays.
+      // a process stops after DDL but before this version record; migrations
+      // use CREATE TABLE IF NOT EXISTS. The lock prevents concurrent replays.
       await connection.beginTransaction();
       try {
         await connection.execute(
