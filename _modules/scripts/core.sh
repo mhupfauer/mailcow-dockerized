@@ -15,6 +15,124 @@ NC='\e[0m'
 
 caller="${BASH_SOURCE[1]##*/}"
 
+mcp_update_config_path() {
+  printf '%s\n' "${MAILCOW_CONF:-${SCRIPT_DIR}/mailcow.conf}"
+}
+
+mcp_update_mark_offered() (
+  local config_path
+  local config_dir
+  local temp_config
+  local profiles
+  local state
+
+  config_path="$(mcp_update_config_path)"
+  config_dir="$(dirname "${config_path}")"
+  umask 077
+  temp_config="$(mktemp "${config_dir}/.mailcow.conf.mcp-offer.XXXXXX")" || return 1
+  if ! awk '
+    BEGIN { count = 0 }
+    /^MCP_UPDATE_OFFERED=/ {
+      print "MCP_UPDATE_OFFERED=1"
+      count++
+      next
+    }
+    { print }
+    END { if (count != 1) exit 1 }
+  ' "${config_path}" > "${temp_config}"; then
+    rm -f -- "${temp_config}"
+    return 1
+  fi
+  chmod 600 "${temp_config}" || {
+    rm -f -- "${temp_config}"
+    return 1
+  }
+  profiles="$(mcp_config_value "${temp_config}" COMPOSE_PROFILES)" || {
+    rm -f -- "${temp_config}"
+    return 1
+  }
+  if mcp_profile_contains "${profiles}" mcp; then
+    state=enabled
+  else
+    state=disabled
+  fi
+  mcp_validate_config "${temp_config}" "${state}" || {
+    rm -f -- "${temp_config}"
+    return 1
+  }
+  mv -- "${temp_config}" "${config_path}"
+)
+
+mcp_update_preflight() {
+  local config_path
+  local profiles
+
+  config_path="$(mcp_update_config_path)"
+  if ! mcp_prepare_config "${config_path}" upgrade; then
+    echo -e "${LIGHT_RED}MCP configuration preparation failed before update.${NC}" >&2
+    return 1
+  fi
+  profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES)" || return 1
+  if mcp_profile_contains "${profiles}" mcp; then
+    MCP_UPDATE_ENABLED=y
+    mcp_validate_config "${config_path}" enabled || return 1
+  else
+    MCP_UPDATE_ENABLED=n
+    mcp_validate_config "${config_path}" disabled || return 1
+  fi
+}
+
+mcp_update_offer() {
+  local config_path
+  local offered
+  local profiles
+  local response
+
+  config_path="$(mcp_update_config_path)"
+  offered="$(mcp_config_value "${config_path}" MCP_UPDATE_OFFERED)" || return 1
+  [[ "${offered}" == 0 ]] || return 0
+  profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES)" || return 1
+  if mcp_profile_contains "${profiles}" mcp; then
+    echo "MCP is already enabled; no adoption prompt is needed"
+    mcp_update_mark_offered
+    return
+  fi
+
+  if [[ -n "${FORCE:-}" || "${SKIP_START:-}" == y || ! -t 0 ]]; then
+    echo "MCP remains disabled. Enable it later with ./helper-scripts/mcp.sh enable"
+    mcp_update_mark_offered
+    return
+  fi
+
+  read -r -p "Enable the optional mailcow MCP service now? [y/N] " response
+  if [[ "${response}" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    if ! "${SCRIPT_DIR}/helper-scripts/mcp.sh" enable; then
+      MCP_UPDATE_ACTIVATION_FAILED=y
+      echo -e "${LIGHT_RED}MCP activation failed; core mailcow remains available.${NC}" >&2
+    fi
+  else
+    echo "MCP remains disabled. Enable it later with ./helper-scripts/mcp.sh enable"
+  fi
+  mcp_update_mark_offered
+}
+
+mcp_update_report() {
+  local config_path
+  local profiles
+
+  config_path="$(mcp_update_config_path)"
+  profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES 2>/dev/null || true)"
+  if [[ -n "${MCP_UPDATE_ACTIVATION_FAILED:-}" ||
+        ( -n "${MCP_UPDATE_STACK_FAILED:-}" && "${MCP_UPDATE_ENABLED:-n}" == y ) ]]; then
+    echo -e "${LIGHT_RED}MCP did not start cleanly. Core mailcow startup was attempted independently.${NC}"
+    echo "Retry MCP with ./helper-scripts/mcp.sh retry"
+  elif mcp_profile_contains "${profiles}" mcp; then
+    echo "MCP remains enabled. Check it with ./helper-scripts/mcp.sh status"
+  else
+    echo "MCP is disabled. Enable it with ./helper-scripts/mcp.sh enable"
+  fi
+}
+
 get_installed_tools(){
     for bin in openssl curl docker git awk sha1sum grep cut jq; do
         if [[ -z $(command -v ${bin}) ]]; then

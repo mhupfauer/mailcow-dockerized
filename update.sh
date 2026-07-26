@@ -200,6 +200,9 @@ done
 
 chmod 600 mailcow.conf
 source mailcow.conf
+# docker compose must read COMPOSE_PROFILES from .env/mailcow.conf. An exported
+# parent-shell value would otherwise override that authoritative configuration.
+unset COMPOSE_PROFILES
 
 get_compose_type
 
@@ -365,6 +368,8 @@ if [ ! "$FORCE" ]; then
   detect_major_update
 fi
 
+mcp_update_preflight || exit 1
+
 echo -e "\e[32mValidating docker-compose stack configuration...\e[0m"
 sed -i 's/HTTPS_BIND:-:/HTTPS_BIND:-/g' docker-compose.yml
 sed -i 's/HTTP_BIND:-:/HTTP_BIND:-/g' docker-compose.yml
@@ -461,9 +466,17 @@ else
   echo -e "\e[33mDEVELOPER MODE: Not creating a git diff and commiting it to prevent development stuff within a backup diff...\e[0m"
 fi
 
+echo -e "\e[32mValidating updated docker-compose stack configuration...\e[0m"
+if ! $COMPOSE_COMMAND config -q; then
+  echo -e "\e[31m\nThe merged docker-compose configuration is invalid. Please check the error message above.\e[0m"
+  exit 1
+fi
+
 echo -e "\e[32mFetching new images, if any...\e[0m"
 sleep 2
-$COMPOSE_COMMAND pull
+if ! $COMPOSE_COMMAND pull; then
+  MCP_UPDATE_STACK_FAILED=y
+fi
 
 # Fix missing SSL, does not overwrite existing files
 [[ ! -d data/assets/ssl ]] && mkdir -p data/assets/ssl
@@ -548,8 +561,13 @@ if [[ ${SKIP_START} == "y" ]]; then
 else
   echo -e "\e[32mStarting mailcow...\e[0m"
   sleep 2
-  $COMPOSE_COMMAND up -d --remove-orphans
+  if ! $COMPOSE_COMMAND up -d --remove-orphans; then
+    MCP_UPDATE_STACK_FAILED=y
+  fi
 fi
+
+mcp_update_offer || echo -e "\e[31mCould not record the MCP update offer state.\e[0m"
+mcp_update_report
 
 echo -e "\e[32mCollecting garbage...\e[0m"
 docker_garbage
