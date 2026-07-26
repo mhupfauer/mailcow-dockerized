@@ -2,6 +2,10 @@ import os
 import subprocess
 from jinja2 import Environment, FileSystemLoader
 
+
+def profile_enabled(value: str, token: str) -> bool:
+  return token in value.split(",")
+
 def includes_conf(env, template_vars):
   server_name = "server_name.active"
   listen_plain = "listen_plain.active"
@@ -60,6 +64,7 @@ def prepare_template_vars():
     'PHPFPMHOST': os.getenv("PHPFPMHOST", "php-fpm-mailcow"),
     'ENABLE_IPV6': os.getenv("ENABLE_IPV6", "true").lower() != "false",
     'HTTP_REDIRECT': os.getenv("HTTP_REDIRECT", "n").lower() in ("y", "yes"),
+    'MCP_ENABLED': profile_enabled(os.getenv("COMPOSE_PROFILES", ""), "mcp"),
   }
 
   ssl_dir = '/etc/ssl/mail/'

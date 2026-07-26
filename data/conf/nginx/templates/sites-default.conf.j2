@@ -144,6 +144,171 @@ location ~ /(?:m|M)ail/(?:c|C)onfig-v1.1.xml {
     try_files /autoconfig.php =404;
 }
 
+{% if MCP_ENABLED %}
+# Resolve the optional MCP container only when a request is proxied to it. This
+# keeps core nginx valid and startable when the mcp Compose profile is disabled.
+resolver 127.0.0.11 valid=10s ipv6=off;
+set $mcp_upstream http://mcp-mailcow:3000;
+
+location = /mcp {
+    client_max_body_size 25m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /.well-known/oauth-protected-resource/mcp {
+    client_max_body_size 1m;
+    client_body_timeout 30s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /.well-known/oauth-authorization-server {
+    client_max_body_size 1m;
+    client_body_timeout 30s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /.well-known/openid-configuration {
+    client_max_body_size 1m;
+    client_body_timeout 30s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /oauth/auth {
+    client_max_body_size 1m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /oauth/token {
+    client_max_body_size 1m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /oauth/reg {
+    client_max_body_size 1m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /oauth/revocation {
+    client_max_body_size 1m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location = /oauth/jwks {
+    client_max_body_size 1m;
+    client_body_timeout 30s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location ~ ^/mcp-login/[^/]+$ {
+    client_max_body_size 1m;
+    client_body_timeout 60s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+
+location ~ ^/mcp-upload/[^/]+$ {
+    access_log off;
+    client_max_body_size 10m;
+    client_body_timeout 120s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $client_req_scheme;
+    proxy_set_header X-Forwarded-For {% if not NGINX_USE_PROXY_PROTOCOL %}$proxy_add_x_forwarded_for{% else %}$proxy_protocol_addr{% endif %};
+    proxy_set_header X-Real-IP {% if not NGINX_USE_PROXY_PROTOCOL %}$remote_addr{% else %}$proxy_protocol_addr{% endif %};
+    proxy_pass $mcp_upstream;
+}
+{% endif %}
+
 {% if not SKIP_RSPAMD %}
 location /rspamd/ {
     location /rspamd/auth {
