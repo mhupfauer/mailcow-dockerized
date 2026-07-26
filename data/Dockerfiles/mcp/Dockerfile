@@ -20,6 +20,7 @@ RUN npm ci --omit=dev \
   && adduser -S -D -H -u 10001 -G mcp mcp
 
 COPY --from=build --chown=10001:10001 /app/dist ./dist
+COPY --from=build --chown=10001:10001 /app/src/db/migrations ./dist/db/migrations
 RUN chmod -R a-w /app
 
 USER 10001:10001

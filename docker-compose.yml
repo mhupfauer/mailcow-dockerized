@@ -34,6 +34,12 @@ services:
         - MYSQL_PASSWORD=${DBPASS}
         - MYSQL_INITDB_SKIP_TZINFO=1
       restart: always
+      healthcheck:
+        test: ["CMD-SHELL", "mariadb-admin ping -h localhost -u root -p$${MYSQL_ROOT_PASSWORD} --silent"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+        start_period: 30s
       ports:
         - "${SQL_PORT:-127.0.0.1:13306}:3306"
       networks:
@@ -660,6 +666,49 @@ services:
           aliases:
             - ofelia
 
+    mcp-db-init:
+      profiles: ["mcp"]
+      image: mailcow/mcp:test
+      command: ["/bin/sh", "-c", "node dist/db/init.js && node dist/db/migrations.js"]
+      restart: "no"
+      depends_on:
+        mysql-mailcow:
+          condition: service_healthy
+      environment:
+        - MCP_DBHOST=mysql-mailcow
+        - MCP_DBPORT=3306
+        - MCP_DBNAME=${MCP_DBNAME:-mailcow_mcp}
+        - MCP_DBUSER=${MCP_DBUSER:-mailcow_mcp}
+        - MCP_DBPASS=${MCP_DBPASS}
+        - DBROOT=${DBROOT}
+      networks:
+        mailcow-network:
+
+    mcp-mailcow:
+      profiles: ["mcp"]
+      image: mailcow/mcp:test
+      restart: always
+      depends_on:
+        mysql-mailcow:
+          condition: service_healthy
+        mcp-db-init:
+          condition: service_completed_successfully
+      environment:
+        - MAILCOW_HOSTNAME=${MAILCOW_HOSTNAME}
+        - MCP_PORT=3000
+        - MCP_DBHOST=mysql-mailcow
+        - MCP_DBPORT=3306
+        - MCP_DBNAME=${MCP_DBNAME:-mailcow_mcp}
+        - MCP_DBUSER=${MCP_DBUSER:-mailcow_mcp}
+        - MCP_DBPASS=${MCP_DBPASS}
+        - MCP_ENCRYPTION_KEY=${MCP_ENCRYPTION_KEY}
+      volumes:
+        - mcp-attachments-vol-1:/var/lib/mailcow-mcp/attachments
+      networks:
+        mailcow-network:
+          aliases:
+            - mcp
+
 networks:
   mailcow-network:
     driver: bridge
@@ -685,3 +734,4 @@ volumes:
   sogo-web-vol-1:
   sogo-userdata-backup-vol-1:
   clamd-db-vol-1:
+  mcp-attachments-vol-1:
