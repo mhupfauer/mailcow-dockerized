@@ -1,6 +1,9 @@
-import { rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { GenericContainer } from "testcontainers";
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { initializeDatabase } from "../../src/db/init.js";
 import { runMigrations } from "../../src/db/migrations.js";
@@ -11,6 +14,15 @@ const rootPassword = "root-password-for-oauth-schema-test";
 const databasePassword = "database-password-for-oauth-schema-test";
 const databaseName = "mailcow_mcp";
 const databaseUser = "mailcow_mcp";
+const migrationBookkeepingSql = `
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INT UNSIGNED NOT NULL PRIMARY KEY,
+    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+const ddlSideEffectSentinelSql = `
+  CREATE TABLE ddl_side_effect_sentinel (id INT NOT NULL PRIMARY KEY);
+`;
 
 interface ColumnMetadata {
   tableName: string;
@@ -92,12 +104,26 @@ const expectedForeignKeys: readonly ForeignKeyRow[] = [
   },
 ];
 
+async function withMigrationFixture<T>(
+  files: Readonly<Record<string, string>>,
+  action: (migrationDirectory: URL) => Promise<T>,
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "mailcow-mcp-migrations-"));
+
+  try {
+    await Promise.all(
+      Object.entries(files).map(([filename, sql]) =>
+        writeFile(join(directory, filename), sql, "utf8"),
+      ),
+    );
+    return await action(pathToFileURL(`${directory}/`));
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+}
+
 describe("OAuth persistence schema", () => {
   let container: Awaited<ReturnType<GenericContainer["start"]>>;
-  const duplicateMigrationUrl = new URL(
-    "../../src/db/migrations/002_duplicate.sql",
-    import.meta.url,
-  );
 
   beforeAll(async () => {
     container = await new GenericContainer("mariadb:10.11")
@@ -108,10 +134,6 @@ describe("OAuth persistence schema", () => {
 
   afterAll(async () => {
     await container?.stop();
-  });
-
-  afterEach(async () => {
-    await rm(duplicateMigrationUrl, { force: true });
   });
 
   test("creates and replays the OAuth tables with exact lookup indexes and explicit account foreign keys", async () => {
@@ -243,38 +265,121 @@ describe("OAuth persistence schema", () => {
     }
   }, 120_000);
 
-  test("rejects duplicate migration versions before running any migration DDL", async () => {
-    await writeFile(duplicateMigrationUrl, "SELECT 1;\n", "utf8");
-
+  async function expectFixtureRejectionBeforeDdl(
+    databaseSuffix: string,
+    files: Readonly<Record<string, string>>,
+    expectedError: string,
+  ): Promise<void> {
     const host = container.getHost();
     const port = container.getMappedPort(3306);
-    const duplicateDatabaseName = "mailcow_mcp_duplicate";
-    const duplicateDatabaseUser = "mailcow_mcp_duplicate";
+    const fixtureDatabaseName = `mailcow_mcp_${databaseSuffix}`;
+    const fixtureDatabaseUser = `mailcow_mcp_${databaseSuffix}`;
 
     await initializeDatabase({
       host,
       port,
       rootPassword,
-      databaseName: duplicateDatabaseName,
-      databaseUser: duplicateDatabaseUser,
+      databaseName: fixtureDatabaseName,
+      databaseUser: fixtureDatabaseUser,
       databasePassword,
     });
 
     const pool = createPool({
       host,
       port,
-      database: duplicateDatabaseName,
-      user: duplicateDatabaseUser,
+      database: fixtureDatabaseName,
+      user: fixtureDatabaseUser,
       password: databasePassword,
     });
 
     try {
-      await expect(runMigrations(pool)).rejects.toThrow(
-        "duplicate MCP database migration version: 2",
+      await withMigrationFixture(files, async (migrationDirectory) => {
+        await expect(runMigrations(pool, { migrationDirectory })).rejects.toThrow(
+          expectedError,
+        );
+      });
+
+      const [tables] = await pool.query<Record<string, string>[]>(
+        "SHOW TABLES",
+      );
+      expect(tables).toEqual([]);
+    } finally {
+      await pool.end();
+    }
+  }
+
+  test("rejects duplicate migration versions before running any migration DDL", async () => {
+    await expectFixtureRejectionBeforeDdl(
+      "duplicate",
+      {
+        "001_initial.sql": migrationBookkeepingSql,
+        "001_duplicate.sql": ddlSideEffectSentinelSql,
+      },
+      "duplicate MCP database migration version: 1",
+    );
+  }, 120_000);
+
+  test.each([
+    ["000_zero.sql", "invalid MCP database migration version: 0"],
+    [
+      "4294967296_future.sql",
+      "invalid MCP database migration version: 4294967296",
+    ],
+  ])("rejects %s before running any migration DDL", async (filename, expectedError) => {
+    await expectFixtureRejectionBeforeDdl(
+      filename.replace(/[^a-z0-9]/gi, "").toLowerCase(),
+      {
+        "001_initial.sql": migrationBookkeepingSql,
+        [filename]: ddlSideEffectSentinelSql,
+      },
+      expectedError,
+    );
+  }, 120_000);
+
+  test("ignores malformed fixture names while applying valid migrations", async () => {
+    const host = container.getHost();
+    const port = container.getMappedPort(3306);
+    const fixtureDatabaseName = "mailcow_mcp_malformed";
+    const fixtureDatabaseUser = "mailcow_mcp_malformed";
+
+    await initializeDatabase({
+      host,
+      port,
+      rootPassword,
+      databaseName: fixtureDatabaseName,
+      databaseUser: fixtureDatabaseUser,
+      databasePassword,
+    });
+
+    const pool = createPool({
+      host,
+      port,
+      database: fixtureDatabaseName,
+      user: fixtureDatabaseUser,
+      password: databasePassword,
+    });
+
+    try {
+      await withMigrationFixture(
+        {
+          "001_initial.sql": migrationBookkeepingSql,
+          "002_sentinel.sql": ddlSideEffectSentinelSql,
+          "not-a-migration.sql": "this is intentionally not SQL;",
+        },
+        async (migrationDirectory) => {
+          await runMigrations(pool, { migrationDirectory });
+        },
       );
 
-      const [tables] = await pool.query<Record<string, string>[]>("SHOW TABLES");
-      expect(tables).toEqual([]);
+      const [migrations] = await pool.query<{ version: number }[]>(
+        "SELECT version FROM schema_migrations ORDER BY version",
+      );
+      const [tables] = await pool.query<Record<string, string>[]>(
+        "SHOW TABLES LIKE 'ddl_side_effect_sentinel'",
+      );
+
+      expect(migrations).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(tables).toHaveLength(1);
     } finally {
       await pool.end();
     }

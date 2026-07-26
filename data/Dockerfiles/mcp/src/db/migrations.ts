@@ -8,24 +8,58 @@ interface Migration {
   filename: string;
 }
 
-const migrationLockName = "mailcow_mcp_migrations";
+interface RunMigrationsOptions {
+  migrationDirectory?: URL;
+}
 
-async function discoverMigrations(): Promise<Migration[]> {
-  const files = await readdir(new URL("./migrations/", import.meta.url));
-  const migrations = files.flatMap((filename): Migration[] => {
+const migrationLockName = "mailcow_mcp_migrations";
+const maxMigrationVersion = 4_294_967_295;
+const runtimeMigrationDirectory = new URL("./migrations/", import.meta.url);
+
+async function discoverMigrations(
+  migrationDirectory: URL,
+): Promise<Migration[]> {
+  const files = await readdir(migrationDirectory);
+  const migrations: Migration[] = [];
+  const discoveredVersions = new Set<number>();
+
+  for (const filename of files) {
     const match = /^(\d+)_[-a-z0-9]+\.sql$/i.exec(filename);
 
-    return match === null ? [] : [{ version: Number(match[1]), filename }];
-  });
+    if (match === null) {
+      continue;
+    }
+
+    const version = Number(match[1]);
+    if (
+      !Number.isSafeInteger(version) ||
+      version < 1 ||
+      version > maxMigrationVersion
+    ) {
+      throw new Error(`invalid MCP database migration version: ${match[1]}`);
+    }
+    if (discoveredVersions.has(version)) {
+      throw new Error(`duplicate MCP database migration version: ${version}`);
+    }
+
+    discoveredVersions.add(version);
+    migrations.push({ version, filename });
+  }
 
   return migrations.sort((left, right) => left.version - right.version);
 }
 
-async function loadMigration(filename: string): Promise<string> {
-  return readFile(new URL(`./migrations/${filename}`, import.meta.url), "utf8");
+async function loadMigration(
+  migrationDirectory: URL,
+  filename: string,
+): Promise<string> {
+  return readFile(new URL(filename, migrationDirectory), "utf8");
 }
 
-export async function runMigrations(pool: Pool): Promise<void> {
+export async function runMigrations(
+  pool: Pool,
+  { migrationDirectory = runtimeMigrationDirectory }: RunMigrationsOptions = {},
+): Promise<void> {
   const connection = await pool.getConnection();
   let lockAcquired = false;
 
@@ -54,24 +88,14 @@ export async function runMigrations(pool: Pool): Promise<void> {
       }
     }
 
-    const migrations = await discoverMigrations();
-    const discoveredVersions = new Set<number>();
-
-    for (const migration of migrations) {
-      if (discoveredVersions.has(migration.version)) {
-        throw new Error(
-          `duplicate MCP database migration version: ${migration.version}`,
-        );
-      }
-      discoveredVersions.add(migration.version);
-    }
+    const migrations = await discoverMigrations(migrationDirectory);
 
     for (const migration of migrations) {
       if (applied.has(migration.version)) {
         continue;
       }
 
-      const statements = (await loadMigration(migration.filename))
+      const statements = (await loadMigration(migrationDirectory, migration.filename))
         .split(";")
         .map((statement) => statement.trim())
         .filter((statement) => statement !== "");
