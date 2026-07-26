@@ -474,8 +474,17 @@ fi
 
 echo -e "\e[32mFetching new images, if any...\e[0m"
 sleep 2
+MCP_UPDATE_USE_CORE_ONLY=n
+MCP_UPDATE_CORE_STARTED=n
+MCP_UPDATE_RESULT=0
 if ! $COMPOSE_COMMAND pull; then
-  MCP_UPDATE_STACK_FAILED=y
+  MCP_UPDATE_USE_CORE_ONLY=y
+  if [[ "${MCP_UPDATE_ENABLED:-n}" == y ]]; then
+    MCP_UPDATE_MCP_FAILED=y
+  fi
+  if ! mcp_update_load_core_services || ! mcp_update_pull_core; then
+    echo -e "\e[31mCore-only image pull also failed; startup will still be attempted with available images.\e[0m"
+  fi
 fi
 
 # Fix missing SSL, does not overwrite existing files
@@ -558,16 +567,37 @@ fi
 
 if [[ ${SKIP_START} == "y" ]]; then
   echo -e "\e[33mNot starting mailcow, please run \"$COMPOSE_COMMAND up -d --remove-orphans\" to start mailcow.\e[0m"
+  if [[ "$(mcp_config_value "${MAILCOW_CONF}" MCP_UPDATE_OFFERED 2>/dev/null || true)" == 0 ]]; then
+    echo "MCP remains disabled. Enable it later with ./helper-scripts/mcp.sh enable"
+    mcp_update_mark_offered ||
+      echo -e "\e[31mCould not record the MCP update offer state.\e[0m"
+  fi
 else
   echo -e "\e[32mStarting mailcow...\e[0m"
   sleep 2
-  if ! $COMPOSE_COMMAND up -d --remove-orphans; then
-    MCP_UPDATE_STACK_FAILED=y
+  if [[ "${MCP_UPDATE_USE_CORE_ONLY}" == y ]]; then
+    mcp_update_start_core || true
+  elif $COMPOSE_COMMAND up -d --remove-orphans; then
+    MCP_UPDATE_CORE_STARTED=y
+  else
+    if [[ "${MCP_UPDATE_ENABLED:-n}" == y ]]; then
+      MCP_UPDATE_MCP_FAILED=y
+    fi
+    echo -e "\e[33mProfile-inclusive startup failed; retrying core mailcow without MCP services.\e[0m"
+    mcp_update_start_core || true
   fi
 fi
 
-mcp_update_offer || echo -e "\e[31mCould not record the MCP update offer state.\e[0m"
-mcp_update_report
+if [[ "${SKIP_START:-n}" != y ]]; then
+  if [[ "${MCP_UPDATE_CORE_STARTED}" == y ]]; then
+    mcp_update_offer ||
+      echo -e "\e[31mCould not record the MCP update offer state.\e[0m"
+  else
+    MCP_UPDATE_CORE_FAILED=y
+    echo -e "\e[31mSkipping MCP adoption because core mailcow startup was not confirmed.\e[0m"
+  fi
+fi
+mcp_update_report || MCP_UPDATE_RESULT=1
 
 echo -e "\e[32mCollecting garbage...\e[0m"
 docker_garbage
@@ -575,6 +605,10 @@ docker_garbage
 # Run post-update-hook
 if [ -f "${SCRIPT_DIR}/post_update_hook.sh" ]; then
   bash "${SCRIPT_DIR}/post_update_hook.sh"
+fi
+
+if [[ "${MCP_UPDATE_RESULT}" -ne 0 ]]; then
+  exit "${MCP_UPDATE_RESULT}"
 fi
 
 # echo "In case you encounter any problem, hard-reset to a state before updating mailcow:"

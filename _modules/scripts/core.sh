@@ -14,6 +14,7 @@ LIGHT_GREEN='\e[92m'
 NC='\e[0m'
 
 caller="${BASH_SOURCE[1]##*/}"
+MCP_UPDATE_CORE_SERVICES=()
 
 mcp_update_config_path() {
   printf '%s\n' "${MAILCOW_CONF:-${SCRIPT_DIR}/mailcow.conf}"
@@ -116,15 +117,78 @@ mcp_update_offer() {
   mcp_update_mark_offered
 }
 
+mcp_update_load_core_services() {
+  local service_output
+  local service
+  local found_nginx=n
+  local found_postfix=n
+
+  MCP_UPDATE_CORE_SERVICES=()
+  if ! service_output="$(
+    unset COMPOSE_PROFILES
+    $COMPOSE_COMMAND config --services
+  )"; then
+    echo -e "${LIGHT_RED}Could not derive the core mailcow Compose services.${NC}" >&2
+    return 1
+  fi
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] || continue
+    if [[ ! "${service}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+      echo -e "${LIGHT_RED}Compose returned an invalid service name.${NC}" >&2
+      return 1
+    fi
+    case "${service}" in
+      mcp-db-init|mcp-mailcow) continue ;;
+      nginx-mailcow) found_nginx=y ;;
+      postfix-mailcow) found_postfix=y ;;
+    esac
+    MCP_UPDATE_CORE_SERVICES+=("${service}")
+  done <<< "${service_output}"
+
+  if [[ ${#MCP_UPDATE_CORE_SERVICES[@]} -eq 0 ||
+        "${found_nginx}" != y || "${found_postfix}" != y ]]; then
+    echo -e "${LIGHT_RED}Derived core service set is incomplete; refusing partial startup.${NC}" >&2
+    return 1
+  fi
+}
+
+mcp_update_pull_core() {
+  if [[ ${#MCP_UPDATE_CORE_SERVICES[@]} -eq 0 ]]; then
+    mcp_update_load_core_services || return 1
+  fi
+  (
+    unset COMPOSE_PROFILES
+    $COMPOSE_COMMAND pull "${MCP_UPDATE_CORE_SERVICES[@]}"
+  )
+}
+
+mcp_update_start_core() {
+  if [[ ${#MCP_UPDATE_CORE_SERVICES[@]} -eq 0 ]]; then
+    mcp_update_load_core_services || return 1
+  fi
+  if (
+    unset COMPOSE_PROFILES
+    $COMPOSE_COMMAND up -d --remove-orphans "${MCP_UPDATE_CORE_SERVICES[@]}"
+  ); then
+    MCP_UPDATE_CORE_STARTED=y
+    return 0
+  fi
+  MCP_UPDATE_CORE_FAILED=y
+  return 1
+}
+
 mcp_update_report() {
   local config_path
   local profiles
 
   config_path="$(mcp_update_config_path)"
   profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES 2>/dev/null || true)"
-  if [[ -n "${MCP_UPDATE_ACTIVATION_FAILED:-}" ||
-        ( -n "${MCP_UPDATE_STACK_FAILED:-}" && "${MCP_UPDATE_ENABLED:-n}" == y ) ]]; then
-    echo -e "${LIGHT_RED}MCP did not start cleanly. Core mailcow startup was attempted independently.${NC}"
+  if [[ -n "${MCP_UPDATE_CORE_FAILED:-}" ]]; then
+    echo -e "${LIGHT_RED}Core mailcow startup failed. MCP adoption was not offered.${NC}"
+    return 1
+  elif [[ -n "${MCP_UPDATE_ACTIVATION_FAILED:-}" ||
+          -n "${MCP_UPDATE_MCP_FAILED:-}" ]]; then
+    echo -e "${LIGHT_RED}MCP services failed, but core mailcow started independently.${NC}"
     echo "Retry MCP with ./helper-scripts/mcp.sh retry"
   elif mcp_profile_contains "${profiles}" mcp; then
     echo "MCP remains enabled. Check it with ./helper-scripts/mcp.sh status"

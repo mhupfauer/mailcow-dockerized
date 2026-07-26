@@ -83,6 +83,10 @@ EOF
 #!/usr/bin/env bash
 set -u
 
+existing_app_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+existing_init_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+new_app_id=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+new_init_id=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 profiles="$(sed -n 's/^COMPOSE_PROFILES=//p' "${MCP_TEST_CONFIG}")"
 printf 'profiles=%s|docker %s\n' "${profiles}" "$*" >> "${MCP_TEST_CALL_LOG}"
 
@@ -96,9 +100,9 @@ case " $* " in
   *" compose --profile mcp up -d --no-deps mcp-mailcow "*) stage=app ;;
   *" compose up -d --no-deps --force-recreate nginx-mailcow "*) stage=nginx ;;
   *" compose --profile mcp stop mcp-mailcow "*) stage=stop ;;
-  *" rm -f new-app "*|*" rm -f new-init "*) stage=remove ;;
+  *" rm -f ${new_app_id} "*|*" rm -f ${new_init_id} "*) stage=remove ;;
   *" compose exec -T mysql-mailcow "*) stage=purge-db ;;
-  *" volume rm mailcowdockerized_mcp-attachments-vol-1 "*) stage=purge-volume ;;
+  *" volume rm labeled-mcp-volume "*) stage=purge-volume ;;
 esac
 
 if [[ -n "${stage}" ]]; then
@@ -107,28 +111,63 @@ fi
 
 if [[ "${1:-}" == "compose" && "${2:-}" == "--profile" && "${3:-}" == "mcp" &&
       "${4:-}" == "ps" && "${5:-}" == "-aq" ]]; then
+  inventory_phase=baseline
+  test -s "${MCP_TEST_STAGE_LOG}" && inventory_phase=post
   case "${6:-}" in
     mcp-mailcow)
+      if [[ "${MCP_TEST_CLEANUP_FAIL_STAGE:-}" == "${inventory_phase}-inventory-app" ]]; then
+        exit 1
+      fi
       if [[ ",${MCP_TEST_EXISTING:-}," == *",mcp-mailcow,"* ]]; then
-        printf 'existing-app\n'
+        printf '%s\n' "${existing_app_id}"
       elif grep -qx 'app' "${MCP_TEST_STAGE_LOG}" 2>/dev/null; then
-        printf 'new-app\n'
+        printf '%s\n' "${new_app_id}"
       fi
       ;;
     mcp-db-init)
+      if [[ "${MCP_TEST_CLEANUP_FAIL_STAGE:-}" == "${inventory_phase}-inventory-init" ]]; then
+        exit 1
+      fi
       if [[ ",${MCP_TEST_EXISTING:-}," == *",mcp-db-init,"* ]]; then
-        printf 'existing-init\n'
+        printf '%s\n' "${existing_init_id}"
       elif grep -qx 'init' "${MCP_TEST_STAGE_LOG}" 2>/dev/null; then
-        printf 'new-init\n'
+        printf '%s\n' "${new_init_id}"
       fi
       ;;
   esac
+fi
+
+if [[ "${1:-}" == volume && "${2:-}" == ls ]]; then
+  case "${MCP_TEST_VOLUME_STATE:-present}" in
+    absent) exit 0 ;;
+    list-error) exit 1 ;;
+    multiple) printf 'labeled-mcp-volume\nother-mcp-volume\n' ;;
+    *) printf 'labeled-mcp-volume\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == volume && "${2:-}" == inspect ]]; then
+  case "${MCP_TEST_VOLUME_STATE:-present}" in
+    inspect-error) exit 1 ;;
+    wrong-label) printf 'other-project|mcp-attachments-vol-1\n' ;;
+    *) printf 'mailcowdockerized|mcp-attachments-vol-1\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ "${stage}" == remove && "${MCP_TEST_CLEANUP_FAIL_STAGE:-}" == remove ]]; then
+  exit 1
 fi
 
 if [[ -n "${stage}" && "${MCP_TEST_FAIL_STAGE:-}" == "${stage}" &&
       ! -e "${MCP_TEST_FAIL_MARKER}" ]]; then
   : > "${MCP_TEST_FAIL_MARKER}"
   exit 1
+fi
+
+if [[ -n "${MCP_TEST_SIGNAL_STAGE:-}" && "${stage}" == "${MCP_TEST_SIGNAL_STAGE}" ]]; then
+  kill -TERM "${MCP_LIFECYCLE_PID}"
 fi
 EOF
 
@@ -141,20 +180,69 @@ stage=discovery
 [[ " $* " == *" -X POST "* && " $* " == *"/mcp "* ]] && stage=mcp-auth
 printf '%s\n' "${stage}" >> "${MCP_TEST_STAGE_LOG}"
 
-if [[ "${MCP_TEST_FAIL_STAGE:-}" == "${stage}" && ! -e "${MCP_TEST_FAIL_MARKER}" ]]; then
-  : > "${MCP_TEST_FAIL_MARKER}"
+if [[ "${MCP_TEST_FAIL_STAGE:-}" == "${stage}" ]]; then
   exit 1
 fi
 
-if [[ "${stage}" == "mcp-auth" ]]; then
-  printf '401'
+output_file=/dev/null
+header_file=
+previous=
+for argument in "$@"; do
+  if [[ "${previous}" == --output ]]; then
+    output_file="${argument}"
+  elif [[ "${previous}" == --dump-header ]]; then
+    header_file="${argument}"
+  fi
+  previous="${argument}"
+done
+
+url="${*: -1}"
+hostname="$(sed -n 's/^MAILCOW_HOSTNAME=//p' "${MCP_TEST_CONFIG}")"
+issuer="https://${hostname}"
+
+if [[ "${url}" == *"/.well-known/oauth-authorization-server" ]]; then
+  attempts=0
+  test -f "${MCP_TEST_READINESS_COUNT}" && attempts="$(cat "${MCP_TEST_READINESS_COUNT}")"
+  attempts=$((attempts + 1))
+  printf '%s\n' "${attempts}" > "${MCP_TEST_READINESS_COUNT}"
+  if (( attempts <= ${MCP_TEST_SLOW_ATTEMPTS:-0} )); then
+    printf '{"error":"starting"}' > "${output_file}"
+    printf '503'
+    exit 0
+  fi
+  if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == authorization-json ]]; then
+    printf '{"issuer":"https://wrong.example.test"}' > "${output_file}"
+  else
+    printf '{"issuer":"%s"}' "${issuer}" > "${output_file}"
+  fi
+  printf '200'
+elif [[ "${url}" == *"/.well-known/oauth-protected-resource/mcp" ]]; then
+  if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == protected-json ]]; then
+    printf '{"resource":"https://wrong.example.test/mcp","authorization_servers":[]}' > "${output_file}"
+  else
+    printf '{"resource":"%s/mcp","authorization_servers":["%s"]}' "${issuer}" "${issuer}" > "${output_file}"
+  fi
+  printf '200'
 else
-  printf '{}'
+  if [[ -n "${header_file}" ]]; then
+    if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == challenge ]]; then
+      printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer\r\n\r\n' > "${header_file}"
+    else
+      printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer resource_metadata="%s/.well-known/oauth-protected-resource/mcp"\r\n\r\n' \
+        "${issuer}" > "${header_file}"
+    fi
+  fi
+  printf '401'
 fi
 EOF
 
+  cat > "${case_dir}/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
   chmod +x "${case_dir}/helper-scripts/mcp.sh" "${case_dir}/bin/id" \
-    "${case_dir}/bin/docker" "${case_dir}/bin/curl"
+    "${case_dir}/bin/docker" "${case_dir}/bin/curl" "${case_dir}/bin/sleep"
   printf '%s\n' "${case_dir}"
 }
 
@@ -169,7 +257,13 @@ run_mcp() {
       MCP_TEST_STAGE_LOG="${case_dir}/stages.log" \
       MCP_TEST_FAIL_MARKER="${case_dir}/failed-once" \
       MCP_TEST_FAIL_STAGE="${MCP_TEST_FAIL_STAGE:-}" \
+      MCP_TEST_CLEANUP_FAIL_STAGE="${MCP_TEST_CLEANUP_FAIL_STAGE:-}" \
       MCP_TEST_EXISTING="${MCP_TEST_EXISTING:-}" \
+      MCP_TEST_SIGNAL_STAGE="${MCP_TEST_SIGNAL_STAGE:-}" \
+      MCP_TEST_INVALID_RESPONSE="${MCP_TEST_INVALID_RESPONSE:-}" \
+      MCP_TEST_SLOW_ATTEMPTS="${MCP_TEST_SLOW_ATTEMPTS:-0}" \
+      MCP_TEST_READINESS_COUNT="${case_dir}/readiness-count" \
+      MCP_TEST_VOLUME_STATE="${MCP_TEST_VOLUME_STATE:-present}" \
       bash "${case_dir}/helper-scripts/mcp.sh" "$@"
   )
 }
@@ -219,7 +313,7 @@ test_enable_rolls_back_each_failure() {
     final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
     [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
       fail "rollback did not recreate nginx with MCP disabled after ${stage} failure"
-    removed_calls="$(grep -c '|docker rm -f new-' "${case_dir}/calls.log" || true)"
+    removed_calls="$(grep -Ec '\|docker rm -f (cccc|dddd)' "${case_dir}/calls.log" || true)"
     if [[ "${stage}" == config || "${stage}" == pull ]]; then
       test "${removed_calls}" = 0 ||
         fail "rollback removed a container before MCP created one at ${stage}"
@@ -242,14 +336,113 @@ test_rollback_preserves_preexisting_mcp_container() {
     fail "enable unexpectedly succeeded with injected app failure"
   fi
 
-  grep -q '|docker rm -f new-app' "${case_dir}/calls.log" ||
+  grep -q '|docker rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' "${case_dir}/calls.log" ||
     fail "rollback did not remove the newly created application container"
-  if grep -q '|docker rm -f existing-init' "${case_dir}/calls.log"; then
+  if grep -q '|docker rm -f bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "${case_dir}/calls.log"; then
     fail "rollback removed a pre-existing MCP initializer container"
   fi
   assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
     "rollback changed config while preserving a pre-existing container"
   pass "rollback removes only newly created MCP containers"
+}
+
+test_baseline_inventory_failure_aborts_without_mutation() {
+  local stage
+  local case_dir
+
+  for stage in baseline-inventory-app baseline-inventory-init; do
+    case_dir="$(make_case "${stage}")"
+    cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+    if MCP_TEST_EXISTING=mcp-mailcow,mcp-db-init MCP_TEST_CLEANUP_FAIL_STAGE="${stage}" \
+      run_mcp "${case_dir}" enable >/dev/null 2>&1; then
+      fail "enable continued after ${stage} failed"
+    fi
+
+    assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+      "${stage} changed configuration bytes"
+    if grep -q '|docker rm -f ' "${case_dir}/calls.log"; then
+      fail "${stage} removed a pre-existing MCP container"
+    fi
+    if grep -q '^profiles=.*mcp|docker compose --profile mcp config -q' "${case_dir}/calls.log"; then
+      fail "${stage} continued into activation"
+    fi
+  done
+  pass "failed baseline inventory aborts before mutation or container removal"
+}
+
+test_term_during_activation_runs_transaction_rollback() {
+  local case_dir
+  local status
+  local final_nginx
+  case_dir="$(make_case signal-term)"
+  cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+  status=0
+  MCP_TEST_SIGNAL_STAGE=app run_mcp "${case_dir}" enable >/dev/null 2>&1 || status=$?
+
+  test "${status}" = 143 || fail "TERM during activation returned ${status}, expected 143"
+  assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+    "TERM during activation did not restore exact config bytes"
+  grep -q '|docker rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    "${case_dir}/calls.log" || fail "TERM rollback did not remove the new MCP app container"
+  final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+  [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+    fail "TERM rollback did not recreate nginx with MCP disabled"
+  test ! -d "${case_dir}/.mcp-lifecycle.lock" ||
+    fail "TERM rollback left the lifecycle lock behind"
+  pass "TERM during an active transaction performs full rollback"
+}
+
+test_rollback_reports_inventory_and_removal_failures() {
+  local stage
+  local case_dir
+  local output
+  local final_nginx
+
+  for stage in post-inventory-app remove; do
+    case_dir="$(make_case "cleanup-${stage}")"
+    cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+    if output="$(MCP_TEST_FAIL_STAGE=app MCP_TEST_CLEANUP_FAIL_STAGE="${stage}" \
+      run_mcp "${case_dir}" enable 2>&1)"; then
+      fail "activation unexpectedly succeeded with ${stage} cleanup failure"
+    fi
+    [[ "${output}" == *"rollback cleanup failed"* ]] ||
+      fail "${stage} cleanup failure was not reported"
+    assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+      "${stage} cleanup failure prevented exact config restoration"
+    final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+    [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+      fail "${stage} cleanup failure prevented disabled nginx recreation"
+  done
+  pass "rollback reports cleanup failures after restoring config and nginx"
+}
+
+test_https_verification_retries_and_validates_metadata() {
+  local case_dir
+  local invalid
+  local final_nginx
+
+  case_dir="$(make_case slow-readiness)"
+  MCP_TEST_SLOW_ATTEMPTS=2 run_mcp "${case_dir}" enable >/dev/null
+  test "$(cat "${case_dir}/readiness-count")" = 3 ||
+    fail "HTTPS verification did not retry bounded readiness until success"
+  grep -q 'curl --connect-timeout 5 --max-time 15' "${case_dir}/calls.log" ||
+    fail "HTTPS verification omitted curl connect/overall timeouts"
+
+  for invalid in authorization-json protected-json challenge; do
+    case_dir="$(make_case "invalid-${invalid}")"
+    cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+    if MCP_TEST_INVALID_RESPONSE="${invalid}" run_mcp "${case_dir}" enable >/dev/null 2>&1; then
+      fail "HTTPS verification accepted invalid ${invalid}"
+    fi
+    assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+      "invalid ${invalid} did not roll back exact config bytes"
+    final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+    [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+      fail "invalid ${invalid} did not recreate disabled nginx"
+  done
+  pass "HTTPS verification retries and validates discovery URLs and challenge"
 }
 
 test_disable_is_idempotent_and_preserves_data_configuration() {
@@ -282,6 +475,8 @@ test_disable_is_idempotent_and_preserves_data_configuration() {
 test_status_retry_and_purge_guards() {
   local case_dir
   local failure_case
+  local volume_case
+  local volume_state
   local output
   case_dir="$(make_case commands foo,bar)"
 
@@ -299,7 +494,28 @@ test_status_retry_and_purge_guards() {
     fail "confirmed purge did not remove the dedicated database"
   grep -qx 'purge-volume' "${case_dir}/stages.log" ||
     fail "confirmed purge did not remove the dedicated attachment volume"
+  grep -q '|docker volume rm labeled-mcp-volume' "${case_dir}/calls.log" ||
+    fail "purge did not remove the exact Compose-labeled MCP volume"
   assert_no_core_down "${case_dir}/calls.log"
+
+  volume_case="$(make_case purge-volume-absent foo,bar)"
+  printf 'PURGE mailcow_mcp\n' |
+    MCP_TEST_VOLUME_STATE=absent run_mcp "${volume_case}" purge >/dev/null ||
+    fail "purge did not accept a truly absent MCP volume"
+  if grep -q '|docker volume rm ' "${volume_case}/calls.log"; then
+    fail "purge tried to remove a volume when the labeled MCP volume was absent"
+  fi
+
+  for volume_state in inspect-error wrong-label; do
+    volume_case="$(make_case "purge-${volume_state}" foo,bar)"
+    if printf 'PURGE mailcow_mcp\n' |
+      MCP_TEST_VOLUME_STATE="${volume_state}" run_mcp "${volume_case}" purge >/dev/null 2>&1; then
+      fail "purge accepted MCP volume state ${volume_state}"
+    fi
+    if grep -q 'compose exec -T mysql-mailcow' "${volume_case}/calls.log"; then
+      fail "purge dropped the database before validating volume state ${volume_state}"
+    fi
+  done
 
   failure_case="$(make_case purge-volume-failure foo,bar)"
   if printf 'PURGE mailcow_mcp\n' |
@@ -415,6 +631,9 @@ test_update_runtime_preflight_and_post_merge_validation() {
   local case_dir="${TEST_DIR}/update-runtime"
   local mock_bin="${case_dir}/bin"
   local update_log="${case_dir}/update.log"
+  local mcp_failure_dir="${TEST_DIR}/update-mcp-failure"
+  local core_failure_dir="${TEST_DIR}/update-core-failure"
+  local update_status
   local config_calls
 
   mkdir -p "${mock_bin}" "${case_dir}/data/assets/ssl-example" \
@@ -456,6 +675,10 @@ if [[ "${1:-}" == compose && "${2:-}" == config && "${3:-}" == -q ]]; then
   printf 'CONFIG-Q marker=%s inherited=%s\n' "${marker:-missing}" "${COMPOSE_PROFILES-unset}" >> "${MCP_UPDATE_TEST_LOG}"
   exit 0
 fi
+if [[ "${1:-}" == compose && "${2:-}" == config && "${3:-}" == --services ]]; then
+  printf '%s\n' mysql-mailcow nginx-mailcow postfix-mailcow mcp-db-init mcp-mailcow
+  exit 0
+fi
 if [[ "${1:-}" == compose && "${2:-}" == config ]]; then
   printf 'name: test\nnetworks:\n  mailcow-network:\n    driver_opts:\n      com.docker.network.bridge.name: br-mailcow\n'
   exit 0
@@ -465,12 +688,27 @@ if [[ "${1:-}" == compose && "${2:-}" == down ]]; then
   exit 0
 fi
 if [[ "${1:-}" == compose && "${2:-}" == pull ]]; then
-  printf 'IMAGE-PULL\n' >> "${MCP_UPDATE_TEST_LOG}"
+  if [[ $# -eq 2 ]]; then
+    printf 'IMAGE-PULL\n' >> "${MCP_UPDATE_TEST_LOG}"
+    if [[ "${MCP_UPDATE_FAIL_MODE:-}" == mcp-inclusive ||
+          "${MCP_UPDATE_FAIL_MODE:-}" == core ]]; then
+      exit 1
+    fi
+  else
+    printf 'CORE-PULL %s\n' "${*:3}" >> "${MCP_UPDATE_TEST_LOG}"
+    [[ "${MCP_UPDATE_FAIL_MODE:-}" == core ]] && exit 1
+  fi
   exit 0
 fi
 if [[ "${1:-}" == compose && "${2:-}" == up ]]; then
   offered="$(sed -n 's/^MCP_UPDATE_OFFERED=//p' mailcow.conf)"
-  printf 'CORE-UP offered=%s\n' "${offered:-missing}" >> "${MCP_UPDATE_TEST_LOG}"
+  if [[ $# -eq 4 ]]; then
+    printf 'CORE-UP offered=%s\n' "${offered:-missing}" >> "${MCP_UPDATE_TEST_LOG}"
+  else
+    printf 'CORE-ONLY-UP offered=%s services=%s\n' \
+      "${offered:-missing}" "${*:5}" >> "${MCP_UPDATE_TEST_LOG}"
+    [[ "${MCP_UPDATE_FAIL_MODE:-}" == core ]] && exit 1
+  fi
   exit 0
 fi
 if [[ "${1:-}" == compose && "${2:-}" == ps ]]; then
@@ -544,6 +782,13 @@ exit 1
 EOF
   chmod +x "${mock_bin}/"*
 
+  cp -R "${case_dir}" "${mcp_failure_dir}"
+  cp -R "${case_dir}" "${core_failure_dir}"
+  for variant_dir in "${mcp_failure_dir}" "${core_failure_dir}"; do
+    write_config "${variant_dir}/mailcow.conf" foo,mcp,bar
+    printf 'IPV4_NETWORK=172.22.1\nENABLE_IPV6=false\n' >> "${variant_dir}/mailcow.conf"
+  done
+
   (
     cd "${case_dir}"
     COMPOSE_PROFILES=host-override \
@@ -578,6 +823,49 @@ EOF
     fail "ordinary update invoked MCP purge"
   fi
   pass "updater prepares MCP config, validates post-merge, and stays non-activating"
+
+  update_status=0
+  (
+    cd "${mcp_failure_dir}"
+    PATH="${mcp_failure_dir}/bin:${PATH}" \
+      MCP_UPDATE_TEST_LOG="${mcp_failure_dir}/update.log" \
+      MCP_UPDATE_FAIL_MODE=mcp-inclusive \
+      bash "${mcp_failure_dir}/update.sh" --dev --force --skip-ping-check \
+      > "${mcp_failure_dir}/output.log" 2>&1
+  ) || update_status=$?
+  test "${update_status}" = 0 ||
+    fail "updater failed after successful core-only recovery"
+  grep -q '^CORE-PULL mysql-mailcow nginx-mailcow postfix-mailcow$' \
+    "${mcp_failure_dir}/update.log" ||
+    fail "MCP-inclusive pull failure did not retry the derived core service set"
+  grep -q '^CORE-ONLY-UP offered=0 services=mysql-mailcow nginx-mailcow postfix-mailcow$' \
+    "${mcp_failure_dir}/update.log" ||
+    fail "updater did not start the derived core service set independently"
+  if grep -E '^CORE-(PULL|ONLY-UP).*mcp-(db-init|mailcow)' \
+    "${mcp_failure_dir}/update.log"; then
+    fail "core-only recovery included an MCP service"
+  fi
+  grep -qx 'MCP_UPDATE_OFFERED=1' "${mcp_failure_dir}/mailcow.conf" ||
+    fail "offer was not handled after confirmed core-only startup"
+  grep -q 'MCP services failed' "${mcp_failure_dir}/output.log" ||
+    fail "successful core-only recovery did not report the MCP failure separately"
+
+  update_status=0
+  (
+    cd "${core_failure_dir}"
+    PATH="${core_failure_dir}/bin:${PATH}" \
+      MCP_UPDATE_TEST_LOG="${core_failure_dir}/update.log" \
+      MCP_UPDATE_FAIL_MODE=core \
+      bash "${core_failure_dir}/update.sh" --dev --force --skip-ping-check \
+      > "${core_failure_dir}/output.log" 2>&1
+  ) || update_status=$?
+  test "${update_status}" -ne 0 ||
+    fail "updater reported success after core-only recovery failed"
+  grep -qx 'MCP_UPDATE_OFFERED=0' "${core_failure_dir}/mailcow.conf" ||
+    fail "updater handled the MCP offer without confirmed core startup"
+  grep -q 'Core mailcow startup failed' "${core_failure_dir}/output.log" ||
+    fail "updater did not distinguish the core startup failure"
+  pass "updater recovers core independently and distinguishes core failure"
 }
 
 [[ -x "${MCP_SCRIPT}" ]] || fail "helper-scripts/mcp.sh is absent"
@@ -585,6 +873,10 @@ EOF
 test_enable_success_and_idempotence
 test_enable_rolls_back_each_failure
 test_rollback_preserves_preexisting_mcp_container
+test_baseline_inventory_failure_aborts_without_mutation
+test_term_during_activation_runs_transaction_rollback
+test_rollback_reports_inventory_and_removal_failures
+test_https_verification_retries_and_validates_metadata
 test_disable_is_idempotent_and_preserves_data_configuration
 test_status_retry_and_purge_guards
 test_inherited_profile_is_not_forwarded_to_compose

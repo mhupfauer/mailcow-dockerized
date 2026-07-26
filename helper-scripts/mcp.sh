@@ -10,6 +10,12 @@ MCP_CONFIG_HELPER="${INSTALL_DIR}/_modules/scripts/mcp_config.sh"
 MCP_LOCK_DIR="${INSTALL_DIR}/.mcp-lifecycle.lock"
 MCP_BACKUP="${MAILCOW_CONF}.mcp.bak"
 MCP_LOCKED=n
+MCP_TRANSACTION_ACTIVE=n
+MCP_TRANSACTION_ROLLING_BACK=n
+MCP_TRANSACTION_PRIOR_APP_IDS=
+MCP_TRANSACTION_PRIOR_INIT_IDS=
+MCP_LIFECYCLE_PID=$$
+export MCP_LIFECYCLE_PID
 
 if [[ ! -r "${MCP_CONFIG_HELPER}" ]]; then
   echo "MCP configuration helper is missing: ${MCP_CONFIG_HELPER}" >&2
@@ -24,7 +30,23 @@ mcp_cleanup_lock() {
   fi
 }
 
-trap mcp_cleanup_lock EXIT
+mcp_finish() {
+  local status="$1"
+
+  trap - EXIT INT TERM
+  if [[ "${MCP_TRANSACTION_ACTIVE}" == y ]]; then
+    if ! mcp_rollback_transaction; then
+      echo "MCP transaction rollback cleanup failed" >&2
+      if [[ "${status}" -eq 0 ]]; then
+        status=1
+      fi
+    fi
+  fi
+  mcp_cleanup_lock
+  exit "${status}"
+}
+
+trap 'mcp_finish "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -140,51 +162,184 @@ mcp_container_ids() {
   mcp_compose --profile mcp ps -aq "$1"
 }
 
+mcp_validate_container_ids() {
+  local ids="$1"
+  local container_id
+
+  while IFS= read -r container_id; do
+    [[ -n "${container_id}" ]] || continue
+    if [[ ! "${container_id}" =~ ^[[:xdigit:]]{12,64}$ ]]; then
+      echo "Docker returned an invalid MCP container ID" >&2
+      return 1
+    fi
+  done <<< "${ids}"
+}
+
 mcp_remove_new_containers() {
   local old_app_ids="$1"
   local old_init_ids="$2"
   local current_ids
   local container_id
+  local cleanup_failed=n
 
-  current_ids="$(mcp_container_ids mcp-mailcow 2>/dev/null || true)"
-  while IFS= read -r container_id; do
-    [[ -n "${container_id}" ]] || continue
-    if ! grep -Fqx "${container_id}" <<< "${old_app_ids}"; then
-      docker rm -f "${container_id}" >/dev/null 2>&1 || true
-    fi
-  done <<< "${current_ids}"
+  if ! current_ids="$(mcp_container_ids mcp-mailcow 2>/dev/null)" ||
+    ! mcp_validate_container_ids "${current_ids}"; then
+    echo "Could not inventory MCP application containers during rollback" >&2
+    cleanup_failed=y
+  else
+    while IFS= read -r container_id; do
+      [[ -n "${container_id}" ]] || continue
+      if ! grep -Fqx "${container_id}" <<< "${old_app_ids}"; then
+        if ! docker rm -f "${container_id}" >/dev/null 2>&1; then
+          echo "Could not remove new MCP application container ${container_id}" >&2
+          cleanup_failed=y
+        fi
+      fi
+    done <<< "${current_ids}"
+  fi
 
-  current_ids="$(mcp_container_ids mcp-db-init 2>/dev/null || true)"
-  while IFS= read -r container_id; do
-    [[ -n "${container_id}" ]] || continue
-    if ! grep -Fqx "${container_id}" <<< "${old_init_ids}"; then
-      docker rm -f "${container_id}" >/dev/null 2>&1 || true
-    fi
-  done <<< "${current_ids}"
+  if ! current_ids="$(mcp_container_ids mcp-db-init 2>/dev/null)" ||
+    ! mcp_validate_container_ids "${current_ids}"; then
+    echo "Could not inventory MCP initializer containers during rollback" >&2
+    cleanup_failed=y
+  else
+    while IFS= read -r container_id; do
+      [[ -n "${container_id}" ]] || continue
+      if ! grep -Fqx "${container_id}" <<< "${old_init_ids}"; then
+        if ! docker rm -f "${container_id}" >/dev/null 2>&1; then
+          echo "Could not remove new MCP initializer container ${container_id}" >&2
+          cleanup_failed=y
+        fi
+      fi
+    done <<< "${current_ids}"
+  fi
+
+  [[ "${cleanup_failed}" == n ]]
 }
 
 mcp_recreate_nginx() {
   mcp_compose up -d --no-deps --force-recreate nginx-mailcow
 }
 
+mcp_rollback_transaction() {
+  local rollback_failed=n
+
+  if [[ "${MCP_TRANSACTION_ROLLING_BACK}" == y ]]; then
+    return 1
+  fi
+  MCP_TRANSACTION_ROLLING_BACK=y
+  MCP_TRANSACTION_ACTIVE=n
+
+  if ! mcp_remove_new_containers \
+    "${MCP_TRANSACTION_PRIOR_APP_IDS}" "${MCP_TRANSACTION_PRIOR_INIT_IDS}"; then
+    rollback_failed=y
+  fi
+  if ! mcp_restore_backup; then
+    echo "Could not restore the pre-activation MCP configuration" >&2
+    rollback_failed=y
+  fi
+  if ! mcp_recreate_nginx; then
+    echo "Could not recreate nginx after MCP rollback" >&2
+    rollback_failed=y
+  fi
+
+  MCP_TRANSACTION_ROLLING_BACK=n
+  if [[ "${rollback_failed}" == y ]]; then
+    echo "MCP rollback cleanup failed; configuration/nginx restoration was still attempted" >&2
+    return 1
+  fi
+}
+
 mcp_verify_https() {
   local hostname
+  local issuer
+  local resource
+  local authorization_body
+  local protected_body
+  local response_headers
   local status
+  local challenge
+  local attempt
+  local ready=n
 
   hostname="$(mcp_config_value "${MAILCOW_CONF}" MAILCOW_HOSTNAME)" || {
     echo "MAILCOW_HOSTNAME must be set exactly once" >&2
     return 1
   }
-  curl --fail --silent --show-error \
-    "https://${hostname}/.well-known/oauth-authorization-server" >/dev/null || return 1
-  curl --fail --silent --show-error \
-    "https://${hostname}/.well-known/oauth-protected-resource/mcp" >/dev/null || return 1
-  status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-    -X POST "https://${hostname}/mcp")" || return 1
-  if [[ "${status}" != 401 ]]; then
-    echo "MCP endpoint returned HTTP ${status}; expected 401" >&2
+  command -v jq >/dev/null 2>&1 || {
+    echo "jq is required to validate MCP discovery metadata" >&2
+    return 1
+  }
+
+  issuer="https://${hostname}"
+  resource="${issuer}/mcp"
+  umask 077
+  authorization_body="$(mktemp "${INSTALL_DIR}/.mcp-authorization.XXXXXX")" || return 1
+  protected_body="$(mktemp "${INSTALL_DIR}/.mcp-protected.XXXXXX")" || {
+    rm -f -- "${authorization_body}"
+    return 1
+  }
+  response_headers="$(mktemp "${INSTALL_DIR}/.mcp-headers.XXXXXX")" || {
+    rm -f -- "${authorization_body}" "${protected_body}"
+    return 1
+  }
+
+  for attempt in 1 2 3 4 5 6; do
+    status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+      --output "${authorization_body}" --write-out '%{http_code}' \
+      "${issuer}/.well-known/oauth-authorization-server")" || status=000
+    if [[ "${status}" == 200 ]]; then
+      ready=y
+      break
+    fi
+    if [[ "${attempt}" -lt 6 ]]; then
+      sleep 5
+    fi
+  done
+  if [[ "${ready}" != y ]]; then
+    echo "MCP authorization discovery did not become ready" >&2
+    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
     return 1
   fi
+  if ! jq -e --arg issuer "${issuer}" \
+    'type == "object" and .issuer == $issuer' "${authorization_body}" >/dev/null; then
+    echo "MCP authorization discovery returned unexpected issuer metadata" >&2
+    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
+    return 1
+  fi
+
+  status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+    --output "${protected_body}" --write-out '%{http_code}' \
+    "${issuer}/.well-known/oauth-protected-resource/mcp")" || status=000
+  if [[ "${status}" != 200 ]] ||
+    ! jq -e --arg resource "${resource}" --arg issuer "${issuer}" \
+      'type == "object" and .resource == $resource and
+       (.authorization_servers | type == "array" and index($issuer) != null)' \
+      "${protected_body}" >/dev/null; then
+    echo "MCP protected-resource discovery returned unexpected metadata" >&2
+    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
+    return 1
+  fi
+
+  status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+    --dump-header "${response_headers}" --output /dev/null --write-out '%{http_code}' \
+    -X POST "${resource}")" || status=000
+  if [[ "${status}" != 401 ]]; then
+    echo "MCP endpoint returned HTTP ${status}; expected 401" >&2
+    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
+    return 1
+  fi
+  challenge="$(tr -d '\r' < "${response_headers}" |
+    awk -F': ' 'tolower($1) == "www-authenticate" { print substr($0, index($0, ":") + 2) }' |
+    tail -1)"
+  if [[ "${challenge}" != \
+    "Bearer resource_metadata=\"${issuer}/.well-known/oauth-protected-resource/mcp\"" ]]; then
+    echo "MCP endpoint returned an unexpected WWW-Authenticate challenge" >&2
+    rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
+    return 1
+  fi
+
+  rm -f -- "${authorization_body}" "${protected_body}" "${response_headers}"
 }
 
 mcp_activate() {
@@ -202,6 +357,7 @@ mcp_enable() {
   local retry="${1:-n}"
   local prior_app_ids
   local prior_init_ids
+  local rollback_failed=n
 
   mcp_require_root || return 1
   mcp_acquire_lock || return 1
@@ -214,39 +370,52 @@ mcp_enable() {
   fi
 
   if mcp_is_enabled; then
-    mcp_validate_config "${MAILCOW_CONF}" enabled || return 1
+    if ! mcp_validate_config "${MAILCOW_CONF}" enabled; then
+      mcp_restore_backup >/dev/null 2>&1 || true
+      return 1
+    fi
     if [[ "${retry}" != y ]]; then
       echo "MCP is already enabled"
       return 0
     fi
   else
-    mcp_validate_config "${MAILCOW_CONF}" disabled || return 1
+    if ! mcp_validate_config "${MAILCOW_CONF}" disabled; then
+      mcp_restore_backup >/dev/null 2>&1 || true
+      return 1
+    fi
   fi
 
-  prior_app_ids="$(mcp_container_ids mcp-mailcow 2>/dev/null || true)"
-  prior_init_ids="$(mcp_container_ids mcp-db-init 2>/dev/null || true)"
-
-  if ! mcp_atomic_set_state enabled y; then
+  if ! prior_app_ids="$(mcp_container_ids mcp-mailcow 2>/dev/null)" ||
+    ! mcp_validate_container_ids "${prior_app_ids}"; then
     mcp_restore_backup >/dev/null 2>&1 || true
-    mcp_recreate_nginx >/dev/null 2>&1 || true
+    echo "Could not capture the baseline MCP application container inventory" >&2
+    return 1
+  fi
+  if ! prior_init_ids="$(mcp_container_ids mcp-db-init 2>/dev/null)" ||
+    ! mcp_validate_container_ids "${prior_init_ids}"; then
+    mcp_restore_backup >/dev/null 2>&1 || true
+    echo "Could not capture the baseline MCP initializer container inventory" >&2
+    return 1
+  fi
+
+  MCP_TRANSACTION_PRIOR_APP_IDS="${prior_app_ids}"
+  MCP_TRANSACTION_PRIOR_INIT_IDS="${prior_init_ids}"
+  MCP_TRANSACTION_ACTIVE=y
+  if ! mcp_atomic_set_state enabled y; then
+    mcp_rollback_transaction || rollback_failed=y
     echo "MCP activation failed while updating configuration; previous state restored" >&2
+    [[ "${rollback_failed}" == n ]] || echo "MCP transaction rollback cleanup failed" >&2
     return 1
   fi
 
   if ! mcp_activate; then
-    mcp_remove_new_containers "${prior_app_ids}" "${prior_init_ids}"
-    if ! mcp_restore_backup; then
-      echo "MCP activation failed and the previous configuration could not be restored" >&2
-      return 1
-    fi
-    if ! mcp_recreate_nginx; then
-      echo "MCP activation failed; configuration was restored, but nginx recreation failed" >&2
-      return 1
-    fi
+    mcp_rollback_transaction || rollback_failed=y
     echo "MCP activation failed; previous configuration restored" >&2
+    [[ "${rollback_failed}" == n ]] || echo "MCP transaction rollback cleanup failed" >&2
     return 1
   fi
 
+  MCP_TRANSACTION_ACTIVE=n
   echo "MCP enabled"
 }
 
@@ -287,6 +456,45 @@ mcp_status() {
   return 1
 }
 
+mcp_resolve_attachment_volume() {
+  local project_name="$1"
+  local volume_output
+  local volume_name
+  local labels
+  local count
+
+  if ! volume_output="$(docker volume ls --quiet \
+    --filter "label=com.docker.compose.project=${project_name}" \
+    --filter "label=com.docker.compose.volume=mcp-attachments-vol-1")"; then
+    echo "Could not query Docker for the MCP attachment volume" >&2
+    return 1
+  fi
+  count="$(printf '%s\n' "${volume_output}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "${count}" == 0 ]]; then
+    printf '\n'
+    return 0
+  fi
+  if [[ "${count}" != 1 ]]; then
+    echo "Docker returned multiple MCP attachment volumes" >&2
+    return 1
+  fi
+  volume_name="$(printf '%s\n' "${volume_output}" | sed '/^$/d')"
+  if [[ ! "${volume_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "Docker returned an invalid MCP attachment volume name" >&2
+    return 1
+  fi
+  if ! labels="$(docker volume inspect "${volume_name}" --format \
+    '{{ index .Labels "com.docker.compose.project" }}|{{ index .Labels "com.docker.compose.volume" }}')"; then
+    echo "Could not inspect the MCP attachment volume" >&2
+    return 1
+  fi
+  if [[ "${labels}" != "${project_name}|mcp-attachments-vol-1" ]]; then
+    echo "MCP attachment volume labels do not match the configured project" >&2
+    return 1
+  fi
+  printf '%s\n' "${volume_name}"
+}
+
 mcp_purge() {
   local dbname
   local dbuser
@@ -319,14 +527,16 @@ mcp_purge() {
   [[ "${dbuser}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,63}$ ]] || return 1
   [[ "${project_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || return 1
 
+  if ! volume_name="$(mcp_resolve_attachment_volume "${project_name}")"; then
+    return 1
+  fi
   sql="DROP DATABASE IF EXISTS \`${dbname}\`; DROP USER IF EXISTS '${dbuser}'@'%';"
   if ! printf '%s\n' "${sql}" |
     mcp_compose exec -T mysql-mailcow mysql -uroot "-p${dbroot}"; then
     echo "MCP database purge failed" >&2
     return 1
   fi
-  volume_name="${project_name}_mcp-attachments-vol-1"
-  if docker volume inspect "${volume_name}" >/dev/null 2>&1 &&
+  if [[ -n "${volume_name}" ]] &&
     ! docker volume rm "${volume_name}" >/dev/null 2>&1; then
     echo "MCP database was purged, but attachment-volume removal failed" >&2
     return 1
