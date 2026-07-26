@@ -9,6 +9,7 @@ interface Migration {
 }
 
 const migrations: Migration[] = [{ version: 1, filename: "001_initial.sql" }];
+const migrationLockName = "mailcow_mcp_migrations";
 
 async function loadMigration(filename: string): Promise<string> {
   return readFile(new URL(`./migrations/${filename}`, import.meta.url), "utf8");
@@ -16,8 +17,19 @@ async function loadMigration(filename: string): Promise<string> {
 
 export async function runMigrations(pool: Pool): Promise<void> {
   const connection = await pool.getConnection();
+  let lockAcquired = false;
 
   try {
+    const [lockRows] = await connection.query<
+      (RowDataPacket & { acquired: number | null })[]
+    >("SELECT GET_LOCK(?, 60) AS acquired", [migrationLockName]);
+
+    if (lockRows[0]?.acquired !== 1) {
+      throw new Error("could not acquire the MCP database migration lock");
+    }
+
+    lockAcquired = true;
+
     const [tables] = await connection.query<RowDataPacket[]>(
       "SHOW TABLES LIKE 'schema_migrations'",
     );
@@ -46,12 +58,25 @@ export async function runMigrations(pool: Pool): Promise<void> {
         await connection.query(statement);
       }
 
-      await connection.execute(
-        "INSERT INTO schema_migrations (version) VALUES (?)",
-        [migration.version],
-      );
+      // MariaDB DDL auto-commits. Migrations must therefore be replay-safe if
+      // a process stops after DDL but before this version record; 001 uses
+      // CREATE TABLE IF NOT EXISTS. The lock prevents concurrent replays.
+      await connection.beginTransaction();
+      try {
+        await connection.execute(
+          "INSERT INTO schema_migrations (version) VALUES (?)",
+          [migration.version],
+        );
+        await connection.commit();
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      }
     }
   } finally {
+    if (lockAcquired) {
+      await connection.query("SELECT RELEASE_LOCK(?)", [migrationLockName]);
+    }
     connection.release();
   }
 }
