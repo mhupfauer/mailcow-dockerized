@@ -24,6 +24,7 @@ fi
 # Load mailcow Generic Scripts
 source _modules/scripts/core.sh
 source _modules/scripts/ipv6_controller.sh
+source _modules/scripts/mcp_config.sh
 
 set -o pipefail
 
@@ -455,6 +456,8 @@ ENABLE_IPV6=${IPV6_BOOL}
 # CAUTION: Disabling this may expose container ports to other neighbors on the same subnet, even if the ports are bound to localhost
 DISABLE_NETFILTER_ISOLATION_RULE=n
 EOF
+
+mcp_prepare_config mailcow.conf new || exit 1
 
 mkdir -p data/assets/ssl
 
