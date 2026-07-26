@@ -8,7 +8,8 @@ const validEnvironment = {
   MCP_DBHOST: "mysql-mailcow",
   MCP_DBNAME: "mailcow_mcp",
   MCP_DBUSER: "mailcow_mcp",
-  MCP_DBPASS: "database-password",
+  MCP_DBPASS:
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
   MCP_ENCRYPTION_KEY:
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 };
@@ -23,6 +24,9 @@ describe("loadConfig", () => {
         "hex",
       ),
     );
+    expect(config.db.password).toBe(
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    );
   });
 
   test("rejects a 63-character encryption key", () => {
@@ -32,6 +36,15 @@ describe("loadConfig", () => {
         MCP_ENCRYPTION_KEY: "a".repeat(63),
       }),
     ).toThrow("MCP_ENCRYPTION_KEY must be 64 hexadecimal characters");
+  });
+
+  test("rejects a database password that is not 64 hexadecimal characters", () => {
+    expect(() =>
+      loadConfig({
+        ...validEnvironment,
+        MCP_DBPASS: "database-password",
+      }),
+    ).toThrow("MCP_DBPASS must be 64 hexadecimal characters");
   });
 
   test("rejects an empty database password without exposing it", () => {

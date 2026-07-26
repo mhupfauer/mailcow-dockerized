@@ -73,6 +73,19 @@ describe("createApp", () => {
     expect(response.status).toBe(503);
   });
 
+  test("reports unavailable when its readiness dependency rejects", async () => {
+    const response = await request(
+      createApp({
+        readiness: async () => {
+          throw new Error("database unavailable");
+        },
+      }),
+      "/health/ready",
+    );
+
+    expect(response.status).toBe(503);
+  });
+
   test("challenges unauthenticated MCP posts with protected-resource metadata", async () => {
     const response = await request(
       createApp({ readiness: async () => true }),

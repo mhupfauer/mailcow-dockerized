@@ -8,8 +8,11 @@ export function createApp(deps: { readiness(): Promise<boolean> }): Express {
   });
 
   app.get("/health/ready", async (_request, response) => {
-    const ready = await deps.readiness();
-    response.sendStatus(ready ? 200 : 503);
+    try {
+      response.sendStatus((await deps.readiness()) ? 200 : 503);
+    } catch {
+      response.sendStatus(503);
+    }
   });
 
   app.post("/mcp", (request, response) => {

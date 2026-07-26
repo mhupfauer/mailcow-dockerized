@@ -33,9 +33,14 @@ function parsePort(value: string): number {
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const hostname = required(env, "MAILCOW_HOSTNAME");
   const encryptionKey = required(env, "MCP_ENCRYPTION_KEY");
+  const databasePassword = required(env, "MCP_DBPASS");
 
   if (!/^[0-9a-fA-F]{64}$/.test(encryptionKey)) {
     throw new Error("MCP_ENCRYPTION_KEY must be 64 hexadecimal characters");
+  }
+
+  if (!/^[0-9a-fA-F]{64}$/.test(databasePassword)) {
+    throw new Error("MCP_DBPASS must be 64 hexadecimal characters");
   }
 
   const issuer = new URL(`https://${hostname}`);
@@ -49,7 +54,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       host: required(env, "MCP_DBHOST"),
       name: required(env, "MCP_DBNAME"),
       user: required(env, "MCP_DBUSER"),
-      password: required(env, "MCP_DBPASS"),
+      password: databasePassword,
     },
     encryptionKey: Buffer.from(encryptionKey, "hex"),
   };
