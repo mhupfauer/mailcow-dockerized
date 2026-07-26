@@ -36,10 +36,9 @@ mcp_finish() {
   local status="$1"
   local rollback_status=0
 
-  MCP_FINISHING=y
-  MCP_ROLLBACK_SIGNAL_STATUS=0
   trap 'mcp_defer_rollback_signal 130' INT
   trap 'mcp_defer_rollback_signal 143' TERM
+  MCP_FINISHING=y
   trap - EXIT
   if [[ "${MCP_TRANSACTION_ACTIVE}" == y ]]; then
     mcp_rollback_transaction || rollback_status=$?
@@ -246,17 +245,18 @@ mcp_defer_rollback_signal() {
 
 mcp_rollback_transaction() {
   local rollback_failed=n
+  local result_status=0
   local signal_status
 
   if [[ "${MCP_TRANSACTION_ROLLING_BACK}" == y ]]; then
     return 1
   fi
-  MCP_TRANSACTION_ROLLING_BACK=y
   if [[ "${MCP_FINISHING}" != y ]]; then
     MCP_ROLLBACK_SIGNAL_STATUS=0
     trap 'mcp_defer_rollback_signal 130' INT
     trap 'mcp_defer_rollback_signal 143' TERM
   fi
+  MCP_TRANSACTION_ROLLING_BACK=y
 
   if ! mcp_remove_new_containers \
     "${MCP_TRANSACTION_PRIOR_APP_IDS}" "${MCP_TRANSACTION_PRIOR_INIT_IDS}"; then
@@ -273,19 +273,21 @@ mcp_rollback_transaction() {
 
   if [[ "${rollback_failed}" == y ]]; then
     echo "MCP rollback cleanup failed; configuration/nginx restoration was still attempted" >&2
+    result_status=1
   fi
 
-  MCP_TRANSACTION_ROLLING_BACK=n
+  signal_status="${MCP_ROLLBACK_SIGNAL_STATUS}"
+  if [[ "${signal_status}" -ne 0 ]]; then
+    result_status="${signal_status}"
+  fi
+
   MCP_TRANSACTION_ACTIVE=n
+  MCP_TRANSACTION_ROLLING_BACK=n
   if [[ "${MCP_FINISHING}" != y ]]; then
     trap 'exit 130' INT
     trap 'exit 143' TERM
   fi
-  signal_status="${MCP_ROLLBACK_SIGNAL_STATUS}"
-  if [[ "${signal_status}" -ne 0 ]]; then
-    return "${signal_status}"
-  fi
-  [[ "${rollback_failed}" == n ]]
+  return "${result_status}"
 }
 
 mcp_verify_https() {
@@ -397,6 +399,10 @@ mcp_enable() {
   mcp_create_backup || return 1
 
   if mcp_is_enabled && [[ "${retry}" != y ]]; then
+    if ! mcp_prepare_config "${MAILCOW_CONF}" upgrade; then
+      echo "MCP configuration preparation failed; no activation was attempted" >&2
+      return 1
+    fi
     if ! mcp_validate_config "${MAILCOW_CONF}" enabled; then
       return 1
     fi

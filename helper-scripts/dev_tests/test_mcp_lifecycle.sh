@@ -271,6 +271,40 @@ if [[ "${MCP_TEST_SIGNAL_STAGE:-}" == config-prepare &&
 fi
 EOF
 
+  cat > "${case_dir}/rollback-debug-hook" <<'EOF'
+set -T
+mcp_test_rollback_debug_hook() {
+  local observed_command="${BASH_COMMAND}"
+  local observed_function="${FUNCNAME[1]:-}"
+
+  [[ "${MCP_TEST_DEBUG_HOOK_RUNNING:-n}" == n ]] || return
+  MCP_TEST_DEBUG_HOOK_RUNNING=y
+
+  if [[ "${observed_function}" == mcp_rollback_transaction &&
+        "${MCP_TEST_SIGNAL_STAGE:-}" == rollback-setup &&
+        "${MCP_TRANSACTION_ROLLING_BACK:-n}" == y &&
+        ! -e "${MCP_TEST_SIGNAL_MARKER}" ]]; then
+    : > "${MCP_TEST_SIGNAL_MARKER}"
+    printf 'setup active=%s rolling=%s\n' \
+      "${MCP_TRANSACTION_ACTIVE:-unset}" \
+      "${MCP_TRANSACTION_ROLLING_BACK:-unset}" >> "${MCP_TEST_ROLLBACK_HOOK_LOG}"
+    kill -TERM "${MCP_LIFECYCLE_PID}"
+  fi
+
+  if [[ "${observed_function}" == mcp_rollback_transaction &&
+        "${observed_command}" == "MCP_TRANSACTION_ACTIVE=n" ]]; then
+    printf 'result active=%s rolling=%s result=%s signal=%s\n' \
+      "${MCP_TRANSACTION_ACTIVE:-unset}" \
+      "${MCP_TRANSACTION_ROLLING_BACK:-unset}" \
+      "${result_status:-unset}" \
+      "${signal_status:-unset}" >> "${MCP_TEST_ROLLBACK_HOOK_LOG}"
+  fi
+
+  MCP_TEST_DEBUG_HOOK_RUNNING=n
+}
+trap mcp_test_rollback_debug_hook DEBUG
+EOF
+
   chmod +x "${case_dir}/helper-scripts/mcp.sh" "${case_dir}/bin/id" \
     "${case_dir}/bin/docker" "${case_dir}/bin/curl" "${case_dir}/bin/sleep" \
     "${case_dir}/bin/mv"
@@ -282,7 +316,8 @@ run_mcp() {
   shift
   (
     cd "${case_dir}"
-    PATH="${case_dir}/bin:${PATH}" \
+    BASH_ENV="${MCP_TEST_BASH_ENV:-}" \
+      PATH="${case_dir}/bin:${PATH}" \
       MCP_TEST_CONFIG="${case_dir}/mailcow.conf" \
       MCP_TEST_CALL_LOG="${case_dir}/calls.log" \
       MCP_TEST_STAGE_LOG="${case_dir}/stages.log" \
@@ -297,6 +332,7 @@ run_mcp() {
       MCP_TEST_CHALLENGE_SLOW_ATTEMPTS="${MCP_TEST_CHALLENGE_SLOW_ATTEMPTS:-0}" \
       MCP_TEST_READINESS_COUNT="${case_dir}/readiness-count" \
       MCP_TEST_SIGNAL_MARKER="${case_dir}/signal-once" \
+      MCP_TEST_ROLLBACK_HOOK_LOG="${case_dir}/rollback-hook.log" \
       MCP_TEST_VOLUME_STATE="${MCP_TEST_VOLUME_STATE:-present}" \
       bash "${case_dir}/helper-scripts/mcp.sh" "$@"
   )
@@ -326,6 +362,48 @@ test_enable_success_and_idempotence() {
   test "$(wc -l < "${case_dir}/calls.log")" = "${calls_before}" ||
     fail "idempotent enable repeated Docker or network side effects"
   pass "enable is ordered, profile-safe, and idempotent"
+}
+
+test_already_enabled_enable_migrates_defaults_without_side_effects() {
+  local case_dir
+  local malformed_dir
+  local before_secret_hash
+
+  case_dir="$(make_case enabled-default-migration foo,mcp,bar)"
+  grep -v '^MCP_AUDIT_RETENTION_DAYS=' "${case_dir}/mailcow.conf" \
+    > "${case_dir}/mailcow.conf.missing-default"
+  mv "${case_dir}/mailcow.conf.missing-default" "${case_dir}/mailcow.conf"
+  chmod 600 "${case_dir}/mailcow.conf"
+  before_secret_hash="$(grep -E '^MCP_(DBPASS|ENCRYPTION_KEY)=' \
+    "${case_dir}/mailcow.conf" | sha256sum | awk '{print $1}')"
+
+  run_mcp "${case_dir}" enable >/dev/null
+
+  grep -qx 'MCP_AUDIT_RETENTION_DAYS=30' "${case_dir}/mailcow.conf" ||
+    fail "already-enabled enable did not append a missing non-secret default"
+  grep -qx 'COMPOSE_PROFILES=foo,mcp,bar' "${case_dir}/mailcow.conf" ||
+    fail "already-enabled default migration changed profile state"
+  test "${before_secret_hash}" = "$(grep -E '^MCP_(DBPASS|ENCRYPTION_KEY)=' \
+    "${case_dir}/mailcow.conf" | sha256sum | awk '{print $1}')" ||
+    fail "already-enabled default migration changed existing secrets"
+  test ! -s "${case_dir}/calls.log" 2>/dev/null ||
+    fail "already-enabled default migration caused Docker or network side effects"
+
+  malformed_dir="$(make_case enabled-malformed-secret foo,mcp,bar)"
+  sed 's/^MCP_DBPASS=.*/MCP_DBPASS=invalid/' "${malformed_dir}/mailcow.conf" \
+    > "${malformed_dir}/mailcow.conf.invalid"
+  mv "${malformed_dir}/mailcow.conf.invalid" "${malformed_dir}/mailcow.conf"
+  chmod 600 "${malformed_dir}/mailcow.conf"
+  cp "${malformed_dir}/mailcow.conf" "${malformed_dir}/before.conf"
+
+  if run_mcp "${malformed_dir}" enable >/dev/null 2>&1; then
+    fail "already-enabled enable accepted a malformed versioned secret"
+  fi
+  assert_file_equals "${malformed_dir}/before.conf" "${malformed_dir}/mailcow.conf" \
+    "failed already-enabled migration changed malformed config bytes"
+  test ! -s "${malformed_dir}/calls.log" 2>/dev/null ||
+    fail "failed already-enabled migration caused Docker or network side effects"
+  pass "already-enabled enable atomically migrates defaults without side effects"
 }
 
 test_enable_rolls_back_each_failure() {
@@ -483,6 +561,37 @@ test_term_during_rollback_cleanup_finishes_rollback() {
   test ! -d "${case_dir}/.mcp-lifecycle.lock" ||
     fail "rollback cleanup TERM left the lifecycle lock behind"
   pass "TERM during rollback cleanup is deferred until rollback completes"
+}
+
+test_term_during_rollback_setup_cannot_bypass_rollback() {
+  local case_dir
+  local status
+  local final_nginx
+  case_dir="$(make_case signal-rollback-setup)"
+  cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+  status=0
+  MCP_TEST_BASH_ENV="${case_dir}/rollback-debug-hook" \
+    MCP_TEST_FAIL_STAGE=app MCP_TEST_SIGNAL_STAGE=rollback-setup \
+    run_mcp "${case_dir}" enable >/dev/null 2>&1 || status=$?
+
+  test "${status}" = 143 ||
+    fail "TERM during rollback setup returned ${status}, expected 143"
+  assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+    "TERM during rollback setup bypassed exact config restoration"
+  grep -q '|docker rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+    "${case_dir}/calls.log" || fail "rollback-setup TERM missed the new MCP app"
+  grep -q '|docker rm -f dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+    "${case_dir}/calls.log" || fail "rollback-setup TERM missed the new initializer"
+  final_nginx="$(grep 'force-recreate nginx-mailcow' "${case_dir}/calls.log" | tail -1)"
+  [[ "${final_nginx}" == profiles=foo,bar\|* ]] ||
+    fail "rollback-setup TERM bypassed disabled nginx recreation"
+  grep -qx 'result active=y rolling=y result=143 signal=143' \
+    "${case_dir}/rollback-hook.log" ||
+    fail "transaction was disarmed before rollback result collection completed"
+  test ! -d "${case_dir}/.mcp-lifecycle.lock" ||
+    fail "rollback-setup TERM left the lifecycle lock behind"
+  pass "TERM during rollback setup cannot bypass an armed transaction"
 }
 
 test_rollback_reports_inventory_and_removal_failures() {
@@ -978,12 +1087,14 @@ EOF
 [[ -x "${MCP_SCRIPT}" ]] || fail "helper-scripts/mcp.sh is absent"
 
 test_enable_success_and_idempotence
+test_already_enabled_enable_migrates_defaults_without_side_effects
 test_enable_rolls_back_each_failure
 test_rollback_preserves_preexisting_mcp_container
 test_baseline_inventory_failure_aborts_without_mutation
 test_term_during_activation_runs_transaction_rollback
 test_term_during_config_preparation_restores_exact_backup
 test_term_during_rollback_cleanup_finishes_rollback
+test_term_during_rollback_setup_cannot_bypass_rollback
 test_rollback_reports_inventory_and_removal_failures
 test_https_verification_retries_and_validates_metadata
 test_disable_is_idempotent_and_preserves_data_configuration
