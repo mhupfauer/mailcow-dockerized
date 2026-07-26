@@ -115,6 +115,107 @@ describe("MCP database bootstrap", () => {
     }
   }, 120_000);
 
+  test("removes pre-existing global privileges and grant option from the MCP user", async () => {
+    const host = container.getHost();
+    const port = container.getMappedPort(3306);
+    const restrictedDatabaseName = "mailcow_mcp_restricted";
+    const restrictedDatabaseUser = "mailcow_mcp_restricted";
+    const bootstrapConfig = {
+      host,
+      port,
+      rootPassword,
+      databaseName: restrictedDatabaseName,
+      databaseUser: restrictedDatabaseUser,
+      databasePassword,
+    };
+
+    await initializeDatabase(bootstrapConfig);
+
+    const rootConnection = await createConnection({
+      host,
+      port,
+      user: "root",
+      password: rootPassword,
+    });
+
+    try {
+      await rootConnection.query(
+        "GRANT SELECT ON *.* TO `mailcow_mcp_restricted`@`%` WITH GRANT OPTION",
+      );
+
+      await initializeDatabase(bootstrapConfig);
+
+      const [grants] = await rootConnection.query<Record<string, string>[]>(
+        "SHOW GRANTS FOR 'mailcow_mcp_restricted'@'%'",
+      );
+      const grantStrings = grants.flatMap((grant) => Object.values(grant));
+
+      expect(grantStrings).toHaveLength(2);
+      expect(grantStrings).toContain(
+        "GRANT ALL PRIVILEGES ON `mailcow_mcp_restricted`.* TO `mailcow_mcp_restricted`@`%`",
+      );
+      expect(grantStrings).toContainEqual(
+        expect.stringMatching(
+          /^GRANT USAGE ON \*\.\* TO `mailcow_mcp_restricted`@`%` IDENTIFIED BY PASSWORD /,
+        ),
+      );
+      expect(grantStrings.join("\n")).not.toContain("GRANT OPTION");
+      expect(grantStrings.join("\n")).not.toContain("GRANT SELECT");
+    } finally {
+      await rootConnection.end();
+    }
+  }, 120_000);
+
+  test("replays initial migration after its DDL exists without a version row", async () => {
+    const host = container.getHost();
+    const port = container.getMappedPort(3306);
+    const partialDatabaseName = "mailcow_mcp_partial";
+    const partialDatabaseUser = "mailcow_mcp_partial";
+
+    await initializeDatabase({
+      host,
+      port,
+      rootPassword,
+      databaseName: partialDatabaseName,
+      databaseUser: partialDatabaseUser,
+      databasePassword,
+    });
+
+    const pool = createPool({
+      host,
+      port,
+      database: partialDatabaseName,
+      user: partialDatabaseUser,
+      password: databasePassword,
+    });
+
+    try {
+      await pool.query(`
+        CREATE TABLE schema_migrations (
+          version INT UNSIGNED NOT NULL PRIMARY KEY,
+          applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await pool.query(`
+        CREATE TABLE service_state (
+          state_key VARCHAR(64) NOT NULL PRIMARY KEY,
+          state_value JSON NOT NULL,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+
+      await runMigrations(pool);
+
+      const [migrations] = await pool.query<{ version: number }[]>(
+        "SELECT version FROM schema_migrations",
+      );
+      expect(migrations).toEqual([{ version: 1 }]);
+    } finally {
+      await pool.end();
+    }
+  }, 120_000);
+
   test("serializes concurrent migration runners behind the MariaDB advisory lock", async () => {
     const host = container.getHost();
     const port = container.getMappedPort(3306);

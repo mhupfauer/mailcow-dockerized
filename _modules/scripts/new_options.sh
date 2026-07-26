@@ -87,10 +87,15 @@ adapt_new_options() {
   "ACME_ACCOUNT_EMAIL"
   )
 
-  mcp_prepare_config mailcow.conf upgrade || return 1
+  if [[ "${MCP_UPDATE_AVAILABLE:-y}" == y ]]; then
+    mcp_prepare_config mailcow.conf upgrade || return 1
+  fi
 
   sed -i --follow-symlinks '$a\' mailcow.conf
   for option in ${CONFIG_ARRAY[@]}; do
+    if [[ "${MCP_UPDATE_AVAILABLE:-y}" != y && "${option}" == MCP_* ]]; then
+      continue
+    fi
     if grep -q "^#\?${option}=" mailcow.conf; then
       continue
     fi

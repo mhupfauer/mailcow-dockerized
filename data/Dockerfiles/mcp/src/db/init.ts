@@ -66,6 +66,9 @@ export async function initializeDatabase(
       [config.databasePassword],
     );
     await connection.query(
+      `REVOKE ALL PRIVILEGES, GRANT OPTION FROM ${databaseUser}@'%'`,
+    );
+    await connection.query(
       `GRANT ALL PRIVILEGES ON ${databaseName}.* TO ${databaseUser}@'%'`,
     );
   } finally {

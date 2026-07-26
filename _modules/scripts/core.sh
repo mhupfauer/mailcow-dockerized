@@ -69,18 +69,27 @@ mcp_update_preflight() {
   local profiles
 
   config_path="$(mcp_update_config_path)"
-  if ! mcp_prepare_config "${config_path}" upgrade; then
-    echo -e "${LIGHT_RED}MCP configuration preparation failed before update.${NC}" >&2
+  profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES)" || {
+    echo -e "${LIGHT_RED}Could not determine whether MCP is enabled; refusing the update.${NC}" >&2
     return 1
-  fi
-  profiles="$(mcp_config_value "${config_path}" COMPOSE_PROFILES)" || return 1
+  }
+  MCP_UPDATE_AVAILABLE=n
   if mcp_profile_contains "${profiles}" mcp; then
     MCP_UPDATE_ENABLED=y
+    if ! mcp_prepare_config "${config_path}" upgrade; then
+      echo -e "${LIGHT_RED}Enabled MCP configuration preparation failed before update.${NC}" >&2
+      return 1
+    fi
     mcp_validate_config "${config_path}" enabled || return 1
   else
     MCP_UPDATE_ENABLED=n
+    if ! mcp_prepare_config "${config_path}" upgrade; then
+      echo -e "${YELLOW}Disabled MCP configuration is unavailable; preserving it and continuing the core update.${NC}" >&2
+      return 0
+    fi
     mcp_validate_config "${config_path}" disabled || return 1
   fi
+  MCP_UPDATE_AVAILABLE=y
 }
 
 mcp_update_offer() {
@@ -89,6 +98,7 @@ mcp_update_offer() {
   local profiles
   local response
 
+  [[ "${MCP_UPDATE_AVAILABLE:-y}" == y ]] || return 0
   config_path="$(mcp_update_config_path)"
   offered="$(mcp_config_value "${config_path}" MCP_UPDATE_OFFERED)" || return 1
   [[ "${offered}" == 0 ]] || return 0
@@ -190,6 +200,9 @@ mcp_update_report() {
           -n "${MCP_UPDATE_MCP_FAILED:-}" ]]; then
     echo -e "${LIGHT_RED}MCP services failed, but core mailcow started independently.${NC}"
     echo "Retry MCP with ./helper-scripts/mcp.sh retry"
+  elif [[ "${MCP_UPDATE_AVAILABLE:-y}" != y ]]; then
+    echo -e "${YELLOW}MCP configuration is unavailable; core mailcow was updated without MCP adoption.${NC}"
+    echo "Repair the MCP settings before running ./helper-scripts/mcp.sh enable"
   elif mcp_profile_contains "${profiles}" mcp; then
     echo "MCP remains enabled. Check it with ./helper-scripts/mcp.sh status"
   else

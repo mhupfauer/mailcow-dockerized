@@ -8,6 +8,7 @@ MCP routes while disabled, or producing syntax nginx cannot load.
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -78,6 +79,26 @@ class McpTemplateTests(unittest.TestCase):
 
         self.assertIn("/mcp", rendered)
         self.assertIn("/oauth/", rendered)
+
+    def test_enabled_upload_route_allows_message_ceiling_plus_multipart_framing(self):
+        rendered = render_sites_default(True)
+        upload_location = re.search(
+            r"location ~ \^/mcp-upload/\[\^/\]\+\$ \{(?P<body>.*?)\n\}",
+            rendered,
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(upload_location)
+        body_limit = re.search(
+            r"client_max_body_size (?P<mebibytes>[0-9]+)m;",
+            upload_location.group("body"),
+        )
+        self.assertIsNotNone(body_limit)
+        self.assertEqual(
+            int(body_limit.group("mebibytes")),
+            26,
+            "upload route must allow the 25 MiB aggregate plus multipart framing",
+        )
 
 
 @unittest.skipUnless(shutil.which("docker"), "Docker is required for nginx image syntax validation")

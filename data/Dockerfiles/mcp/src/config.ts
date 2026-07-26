@@ -2,6 +2,7 @@ export interface AppConfig {
   hostname: string;
   issuer: URL;
   resource: URL;
+  resourceMetadataUrl: URL;
   port: number;
   db: { host: string; name: string; user: string; password: string };
   encryptionKey: Buffer;
@@ -49,6 +50,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     hostname,
     issuer,
     resource: new URL("/mcp", issuer),
+    resourceMetadataUrl: new URL(
+      "/.well-known/oauth-protected-resource/mcp",
+      issuer,
+    ),
     port: parsePort(required(env, "MCP_PORT")),
     db: {
       host: required(env, "MCP_DBHOST"),

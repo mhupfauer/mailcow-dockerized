@@ -397,16 +397,6 @@ fi
 echo -e "\e[32mPrefetching images...\e[0m"
 prefetch_images
 
-echo -e "\e[32mStopping mailcow...\e[0m"
-sleep 2
-MAILCOW_CONTAINERS=($($COMPOSE_COMMAND ps -q))
-$COMPOSE_COMMAND down
-echo -e "\e[32mChecking for remaining containers...\e[0m"
-sleep 2
-for container in "${MAILCOW_CONTAINERS[@]}"; do
-  docker rm -f "$container" 2> /dev/null
-done
-
 configure_ipv6
 
 [[ -f data/conf/nginx/ZZZ-ejabberd.conf ]] && rm data/conf/nginx/ZZZ-ejabberd.conf
@@ -471,6 +461,16 @@ if ! $COMPOSE_COMMAND config -q; then
   echo -e "\e[31m\nThe merged docker-compose configuration is invalid. Please check the error message above.\e[0m"
   exit 1
 fi
+
+echo -e "\e[32mStopping mailcow...\e[0m"
+sleep 2
+MAILCOW_CONTAINERS=($($COMPOSE_COMMAND ps -q))
+$COMPOSE_COMMAND down
+echo -e "\e[32mChecking for remaining containers...\e[0m"
+sleep 2
+for container in "${MAILCOW_CONTAINERS[@]}"; do
+  docker rm -f "$container" 2> /dev/null
+done
 
 echo -e "\e[32mFetching new images, if any...\e[0m"
 sleep 2
@@ -567,7 +567,8 @@ fi
 
 if [[ ${SKIP_START} == "y" ]]; then
   echo -e "\e[33mNot starting mailcow, please run \"$COMPOSE_COMMAND up -d --remove-orphans\" to start mailcow.\e[0m"
-  if [[ "$(mcp_config_value "${MAILCOW_CONF}" MCP_UPDATE_OFFERED 2>/dev/null || true)" == 0 ]]; then
+  if [[ "${MCP_UPDATE_AVAILABLE:-y}" == y &&
+        "$(mcp_config_value "${MAILCOW_CONF}" MCP_UPDATE_OFFERED 2>/dev/null || true)" == 0 ]]; then
     echo "MCP remains disabled. Enable it later with ./helper-scripts/mcp.sh enable"
     mcp_update_mark_offered ||
       echo -e "\e[31mCould not record the MCP update offer state.\e[0m"

@@ -55,20 +55,44 @@ async function request(
 
 describe("createApp", () => {
   test("reports a live process", async () => {
-    const response = await request(createApp({ readiness: async () => false }), "/health/live");
+    const response = await request(
+      createApp({
+        readiness: async () => false,
+        resourceMetadataUrl: new URL(
+          "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+        ),
+      }),
+      "/health/live",
+    );
 
     expect(response.status).toBe(200);
     expect(response.json()).toEqual({ status: "live" });
   });
 
   test("reports ready when its readiness dependency resolves true", async () => {
-    const response = await request(createApp({ readiness: async () => true }), "/health/ready");
+    const response = await request(
+      createApp({
+        readiness: async () => true,
+        resourceMetadataUrl: new URL(
+          "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+        ),
+      }),
+      "/health/ready",
+    );
 
     expect(response.status).toBe(200);
   });
 
   test("reports unavailable when its readiness dependency resolves false", async () => {
-    const response = await request(createApp({ readiness: async () => false }), "/health/ready");
+    const response = await request(
+      createApp({
+        readiness: async () => false,
+        resourceMetadataUrl: new URL(
+          "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+        ),
+      }),
+      "/health/ready",
+    );
 
     expect(response.status).toBe(503);
   });
@@ -79,6 +103,9 @@ describe("createApp", () => {
         readiness: async () => {
           throw new Error("database unavailable");
         },
+        resourceMetadataUrl: new URL(
+          "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+        ),
       }),
       "/health/ready",
     );
@@ -86,12 +113,17 @@ describe("createApp", () => {
     expect(response.status).toBe(503);
   });
 
-  test("challenges unauthenticated MCP posts with protected-resource metadata", async () => {
+  test("challenges unauthenticated MCP posts with configured metadata despite a hostile Host", async () => {
     const response = await request(
-      createApp({ readiness: async () => true }),
+      createApp({
+        readiness: async () => true,
+        resourceMetadataUrl: new URL(
+          "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+        ),
+      }),
       "/mcp",
       "POST",
-      { host: "mail.example.test" },
+      { host: "attacker.example.test" },
     );
 
     expect(response.status).toBe(401);

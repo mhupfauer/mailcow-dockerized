@@ -1,6 +1,11 @@
 import express, { type Express } from "express";
 
-export function createApp(deps: { readiness(): Promise<boolean> }): Express {
+interface AppDependencies {
+  readiness(): Promise<boolean>;
+  resourceMetadataUrl: URL;
+}
+
+export function createApp(deps: AppDependencies): Express {
   const app = express();
 
   app.get("/health/live", (_request, response) => {
@@ -15,11 +20,10 @@ export function createApp(deps: { readiness(): Promise<boolean> }): Express {
     }
   });
 
-  app.post("/mcp", (request, response) => {
-    const host = request.get("host") ?? "localhost";
+  app.post("/mcp", (_request, response) => {
     response.set(
       "WWW-Authenticate",
-      `Bearer resource_metadata="https://${host}/.well-known/oauth-protected-resource/mcp"`,
+      `Bearer resource_metadata="${deps.resourceMetadataUrl.href}"`,
     );
     response.sendStatus(401);
   });

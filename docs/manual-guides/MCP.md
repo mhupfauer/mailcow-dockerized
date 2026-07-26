@@ -22,10 +22,11 @@ profiles. Before changing the enabled state, the lifecycle helper makes a
 mode-`0600` backup at `mailcow.conf.mcp.bak`; keep this file with the same care
 as `mailcow.conf`.
 
-Back up `mailcow.conf` before upgrades and keep the normal mailcow backups.
-MCP state uses its own MariaDB schema and attachment volume, so an MCP backup
-and recovery plan should include both the database and that volume when MCP is
-enabled.
+Back up `mailcow.conf` before upgrades and include the MCP MariaDB schema in
+the normal durable database backup. Those are the durable MCP recovery inputs.
+The attachment volume contains only staged uploads, so backing it up is
+optional; staged uploads may be lost during backup or recovery and must be
+uploaded again.
 
 ## Lifecycle commands
 

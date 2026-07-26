@@ -27,6 +27,10 @@ describe("loadConfig", () => {
     expect(config.db.password).toBe(
       "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     );
+    expect(config.resource.href).toBe("https://mail.example.test/mcp");
+    expect(config.resourceMetadataUrl.href).toBe(
+      "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
+    );
   });
 
   test("rejects a 63-character encryption key", () => {

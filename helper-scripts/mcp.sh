@@ -558,7 +558,42 @@ mcp_resolve_attachment_volume() {
   printf '%s\n' "${volume_name}"
 }
 
+mcp_resolve_stopped_app_container() {
+  local project_name="$1"
+  local container_output
+  local container_id
+  local ownership_and_state
+  local count
+
+  if ! container_output="$(mcp_container_ids mcp-mailcow 2>/dev/null)" ||
+    ! mcp_validate_container_ids "${container_output}"; then
+    echo "Could not query Docker for the MCP application container" >&2
+    return 1
+  fi
+  count="$(printf '%s\n' "${container_output}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [[ "${count}" == 0 ]]; then
+    printf '\n'
+    return 0
+  fi
+  if [[ "${count}" != 1 ]]; then
+    echo "Docker returned multiple MCP application containers" >&2
+    return 1
+  fi
+  container_id="$(printf '%s\n' "${container_output}" | sed '/^$/d')"
+  if ! ownership_and_state="$(docker inspect "${container_id}" --format \
+    '{{ index .Config.Labels "com.docker.compose.project" }}|{{ index .Config.Labels "com.docker.compose.service" }}|{{ .State.Running }}')"; then
+    echo "Could not inspect the MCP application container" >&2
+    return 1
+  fi
+  if [[ "${ownership_and_state}" != "${project_name}|mcp-mailcow|false" ]]; then
+    echo "MCP application container is not the stopped Compose-owned service" >&2
+    return 1
+  fi
+  printf '%s\n' "${container_id}"
+}
+
 mcp_purge() {
+  local app_container_id
   local dbname
   local dbuser
   local dbroot
@@ -590,7 +625,15 @@ mcp_purge() {
   [[ "${dbuser}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,63}$ ]] || return 1
   [[ "${project_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || return 1
 
+  if ! app_container_id="$(mcp_resolve_stopped_app_container "${project_name}")"; then
+    return 1
+  fi
   if ! volume_name="$(mcp_resolve_attachment_volume "${project_name}")"; then
+    return 1
+  fi
+  if [[ -n "${app_container_id}" ]] &&
+    ! docker rm "${app_container_id}" >/dev/null 2>&1; then
+    echo "Could not remove the stopped MCP application container" >&2
     return 1
   fi
   sql="DROP DATABASE IF EXISTS \`${dbname}\`; DROP USER IF EXISTS '${dbuser}'@'%';"

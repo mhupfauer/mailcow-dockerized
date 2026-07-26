@@ -101,6 +101,7 @@ case " $* " in
   *" compose up -d --no-deps --force-recreate nginx-mailcow "*) stage=nginx ;;
   *" compose --profile mcp stop mcp-mailcow "*) stage=stop ;;
   *" rm -f ${new_app_id} "*|*" rm -f ${new_init_id} "*) stage=remove ;;
+  *" rm ${existing_app_id} "*) stage=purge-container ;;
   *" compose exec -T mysql-mailcow "*) stage=purge-db ;;
   *" volume rm labeled-mcp-volume "*) stage=purge-volume ;;
 esac
@@ -154,6 +155,23 @@ if [[ "${1:-}" == volume && "${2:-}" == inspect ]]; then
     *) printf 'mailcowdockerized|mcp-attachments-vol-1\n' ;;
   esac
   exit 0
+fi
+
+if [[ "${1:-}" == inspect && "${2:-}" == "${existing_app_id}" ]]; then
+  case "${MCP_TEST_APP_CONTAINER_STATE:-stopped}" in
+    inspect-error) exit 1 ;;
+    wrong-label) printf 'other-project|mcp-mailcow|false\n' ;;
+    wrong-service) printf 'mailcowdockerized|other-service|false\n' ;;
+    running) printf 'mailcowdockerized|mcp-mailcow|true\n' ;;
+    *) printf 'mailcowdockerized|mcp-mailcow|false\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ "${stage}" == purge-volume &&
+      "${MCP_TEST_VOLUME_REJECT_REFERENCE:-n}" == y ]] &&
+  ! grep -qx 'purge-container' "${MCP_TEST_STAGE_LOG}" 2>/dev/null; then
+  exit 1
 fi
 
 if [[ "${stage}" == remove && "${MCP_TEST_CLEANUP_FAIL_STAGE:-}" == remove ]]; then
@@ -334,6 +352,8 @@ run_mcp() {
       MCP_TEST_SIGNAL_MARKER="${case_dir}/signal-once" \
       MCP_TEST_ROLLBACK_HOOK_LOG="${case_dir}/rollback-hook.log" \
       MCP_TEST_VOLUME_STATE="${MCP_TEST_VOLUME_STATE:-present}" \
+      MCP_TEST_APP_CONTAINER_STATE="${MCP_TEST_APP_CONTAINER_STATE:-stopped}" \
+      MCP_TEST_VOLUME_REJECT_REFERENCE="${MCP_TEST_VOLUME_REJECT_REFERENCE:-n}" \
       bash "${case_dir}/helper-scripts/mcp.sh" "$@"
   )
 }
@@ -776,6 +796,39 @@ test_purge_requires_disabled_state() {
   pass "purge requires MCP to be disabled"
 }
 
+test_purge_removes_validated_stopped_app_before_data() {
+  local app_state
+  local case_dir
+
+  case_dir="$(make_case purge-stopped-app foo,bar)"
+  printf 'PURGE mailcow_mcp\n' |
+    MCP_TEST_EXISTING=mcp-mailcow \
+    MCP_TEST_VOLUME_REJECT_REFERENCE=y \
+    run_mcp "${case_dir}" purge >/dev/null ||
+    fail "purge did not remove the stopped MCP application reference"
+  [[ "$(tr '\n' ' ' < "${case_dir}/stages.log")" == \
+    "purge-container purge-db purge-volume " ]] ||
+    fail "purge did not remove the stopped application before database and volume data"
+  grep -q '|docker rm aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' \
+    "${case_dir}/calls.log" ||
+    fail "purge did not remove the exact Compose-owned MCP application container"
+
+  for app_state in running wrong-label wrong-service inspect-error; do
+    case_dir="$(make_case "purge-app-${app_state}" foo,bar)"
+    if printf 'PURGE mailcow_mcp\n' |
+      MCP_TEST_EXISTING=mcp-mailcow \
+      MCP_TEST_APP_CONTAINER_STATE="${app_state}" \
+      run_mcp "${case_dir}" purge >/dev/null 2>&1; then
+      fail "purge accepted MCP application container state ${app_state}"
+    fi
+    if grep -Eq '\|docker (rm |compose exec -T mysql-mailcow|volume rm )' \
+      "${case_dir}/calls.log"; then
+      fail "purge removed container or data for MCP application state ${app_state}"
+    fi
+  done
+  pass "purge removes only a validated stopped Compose application before data"
+}
+
 test_update_offer_never_activates_unattended_or_skip_start() {
   local mode
   local case_dir
@@ -847,6 +900,8 @@ test_update_runtime_preflight_and_post_merge_validation() {
   local case_dir="${TEST_DIR}/update-runtime"
   local mock_bin="${case_dir}/bin"
   local update_log="${case_dir}/update.log"
+  local candidate_failure_dir="${TEST_DIR}/update-candidate-validation-failure"
+  local damaged_config_dir="${TEST_DIR}/update-damaged-disabled-config"
   local mcp_failure_dir="${TEST_DIR}/update-mcp-failure"
   local core_failure_dir="${TEST_DIR}/update-core-failure"
   local update_status
@@ -889,6 +944,11 @@ fi
 if [[ "${1:-}" == compose && "${2:-}" == config && "${3:-}" == -q ]]; then
   marker="$(sed -n 's/^MCP_CONFIG_VERSION=//p' mailcow.conf)"
   printf 'CONFIG-Q marker=%s inherited=%s\n' "${marker:-missing}" "${COMPOSE_PROFILES-unset}" >> "${MCP_UPDATE_TEST_LOG}"
+  config_calls="$(grep -c '^CONFIG-Q ' "${MCP_UPDATE_TEST_LOG}" || true)"
+  if [[ "${MCP_UPDATE_FAIL_MODE:-}" == candidate-config &&
+        "${config_calls}" -ge 2 ]]; then
+    exit 1
+  fi
   exit 0
 fi
 if [[ "${1:-}" == compose && "${2:-}" == config && "${3:-}" == --services ]]; then
@@ -998,12 +1058,68 @@ exit 1
 EOF
   chmod +x "${mock_bin}/"*
 
+  cp -R "${case_dir}" "${candidate_failure_dir}"
+  cp -R "${case_dir}" "${damaged_config_dir}"
   cp -R "${case_dir}" "${mcp_failure_dir}"
   cp -R "${case_dir}" "${core_failure_dir}"
   for variant_dir in "${mcp_failure_dir}" "${core_failure_dir}"; do
     write_config "${variant_dir}/mailcow.conf" foo,mcp,bar
     printf 'IPV4_NETWORK=172.22.1\nENABLE_IPV6=false\n' >> "${variant_dir}/mailcow.conf"
   done
+
+  write_config "${damaged_config_dir}/mailcow.conf" foo,bar
+  printf 'IPV4_NETWORK=172.22.1\nENABLE_IPV6=false\n' \
+    >> "${damaged_config_dir}/mailcow.conf"
+  sed -i '' '/^MCP_ENCRYPTION_KEY=/d' "${damaged_config_dir}/mailcow.conf"
+  grep '^MCP_' "${damaged_config_dir}/mailcow.conf" \
+    > "${damaged_config_dir}/mcp-config-before"
+
+  update_status=0
+  (
+    cd "${candidate_failure_dir}"
+    PATH="${candidate_failure_dir}/bin:${PATH}" \
+      MCP_UPDATE_TEST_LOG="${candidate_failure_dir}/update.log" \
+      MCP_UPDATE_FAIL_MODE=candidate-config \
+      bash "${candidate_failure_dir}/update.sh" --dev --force --skip-ping-check \
+      > "${candidate_failure_dir}/output.log" 2>&1
+  ) || update_status=$?
+  test "${update_status}" -ne 0 ||
+    fail "updater accepted an invalid merged Compose candidate"
+  test "$(grep -c '^CONFIG-Q ' "${candidate_failure_dir}/update.log" || true)" = 2 ||
+    fail "updater did not reach the failing merged-candidate validation"
+  if grep -Eq '^CORE-DOWN$|^IMAGE-PULL$' "${candidate_failure_dir}/update.log"; then
+    fail "updater stopped core or pulled candidate images before validating the merged candidate"
+  fi
+  pass "invalid merged Compose candidate aborts before core teardown"
+
+  update_status=0
+  (
+    cd "${damaged_config_dir}"
+    PATH="${damaged_config_dir}/bin:${PATH}" \
+      MCP_UPDATE_TEST_LOG="${damaged_config_dir}/update.log" \
+      bash "${damaged_config_dir}/update.sh" --dev --force --skip-ping-check \
+      > "${damaged_config_dir}/output.log" 2>&1
+  ) || update_status=$?
+  test "${update_status}" = 0 ||
+    fail "disabled damaged MCP configuration blocked the core update"
+  grep -qx 'CORE-DOWN' "${damaged_config_dir}/update.log" ||
+    fail "core update did not continue through teardown with disabled damaged MCP configuration"
+  grep -qx 'IMAGE-PULL' "${damaged_config_dir}/update.log" ||
+    fail "core update did not continue through image pull with disabled damaged MCP configuration"
+  grep -qx 'CORE-UP offered=0' "${damaged_config_dir}/update.log" ||
+    fail "core update did not restart while the MCP offer remained suppressed"
+  grep '^MCP_' "${damaged_config_dir}/mailcow.conf" \
+    > "${damaged_config_dir}/mcp-config-after"
+  assert_file_equals \
+    "${damaged_config_dir}/mcp-config-before" \
+    "${damaged_config_dir}/mcp-config-after" \
+    "core update changed disabled damaged MCP configuration"
+  if grep -q '^MCP-LIFECYCLE enable$' "${damaged_config_dir}/update.log"; then
+    fail "disabled damaged MCP configuration was offered for activation"
+  fi
+  grep -q 'MCP configuration is unavailable' "${damaged_config_dir}/output.log" ||
+    fail "core update did not report the unavailable MCP configuration"
+  pass "disabled damaged MCP configuration does not block the core update"
 
   (
     cd "${case_dir}"
@@ -1026,7 +1142,7 @@ EOF
     /^CONFIG-Q / { config_count++; if (config_count == 1) first = NR; else second = NR }
     /^CORE-DOWN$/ { down = NR }
     /^IMAGE-PULL$/ { pull = NR }
-    END { exit !(first < down && down < second && second < pull) }
+    END { exit !(first < second && second < down && down < pull) }
   ' "${update_log}" || fail "post-merge validation ran in the wrong updater sequence"
   grep -qx 'CORE-UP offered=0' "${update_log}" ||
     fail "one-time MCP offer was handled before core startup"
@@ -1103,6 +1219,15 @@ test_mcp_image_release_policy() {
 
 [[ -x "${MCP_SCRIPT}" ]] || fail "helper-scripts/mcp.sh is absent"
 
+if [[ "${MCP_TEST_FOCUS:-}" == update ]]; then
+  test_update_runtime_preflight_and_post_merge_validation
+  exit 0
+fi
+if [[ "${MCP_TEST_FOCUS:-}" == purge ]]; then
+  test_purge_removes_validated_stopped_app_before_data
+  exit 0
+fi
+
 test_mcp_image_release_policy
 test_enable_success_and_idempotence
 test_already_enabled_enable_migrates_defaults_without_side_effects
@@ -1119,5 +1244,6 @@ test_disable_is_idempotent_and_preserves_data_configuration
 test_status_retry_and_purge_guards
 test_inherited_profile_is_not_forwarded_to_compose
 test_purge_requires_disabled_state
+test_purge_removes_validated_stopped_app_before_data
 test_update_offer_never_activates_unattended_or_skip_start
 test_update_runtime_preflight_and_post_merge_validation

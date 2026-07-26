@@ -208,96 +208,11 @@ test_new_install_marks_offer_handled() {
   pass "new install marks the MCP offer handled and remains disabled"
 }
 
-test_update_exits_when_mcp_migration_fails() {
-  local case_dir="${TEST_DIR}/update-failure"
-  local mock_bin="${case_dir}/bin"
-  local continued_log="${case_dir}/continued.log"
-  local update_output="${case_dir}/update-output.log"
-
-  mkdir -p "${mock_bin}"
-  ln -s "${REPO_DIR}/_modules" "${case_dir}/_modules"
-  cp "${REPO_DIR}/update.sh" "${case_dir}/update.sh"
-  cp "${REPO_DIR}/docker-compose.yml" "${case_dir}/docker-compose.yml"
-  cat > "${case_dir}/mailcow.conf" <<'EOF'
-MAILCOW_HOSTNAME=mail.example.test
-COMPOSE_PROJECT_NAME=mailcowdockerized
-MCP_CONFIG_VERSION=1
-MCP_DBPASS=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-COMPOSE_PROFILES=
-EOF
-  cat > "${mock_bin}/docker" <<'EOF'
-#!/usr/bin/env bash
-case "$1 $2 $3" in
-  'version --format {{.Server.Version}}') printf '24.0.0\n' ;;
-  'compose version --short') printf '2.0.0\n' ;;
-  'compose pull '*) printf 'continued\n' >> "${UPDATE_TEST_CONTINUED_LOG}" ;;
-esac
-EOF
-  cat > "${mock_bin}/git" <<'EOF'
-#!/usr/bin/env bash
-case "$1" in
-  rev-parse) printf 'master\n' ;;
-  diff-index) exit 0 ;;
-  show) exit 0 ;;
-esac
-EOF
-  cat > "${mock_bin}/curl" <<'EOF'
-#!/usr/bin/env bash
-printf '200'
-EOF
-  cat > "${mock_bin}/jq" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  cat > "${mock_bin}/sleep" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  cat > "${mock_bin}/id" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == -u ]]; then
-  printf '0\n'
-else
-  command id "$@"
-fi
-EOF
-  cat > "${mock_bin}/sed" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == -i ]]; then
-  exit 0
-fi
-exec /usr/bin/sed "$@"
-EOF
-  cat > "${mock_bin}/cp" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == -n ]]; then
-  exit 0
-fi
-exec /bin/cp "$@"
-EOF
-  cat > "${mock_bin}/iptables" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  chmod +x "${mock_bin}/docker" "${mock_bin}/git" "${mock_bin}/curl" "${mock_bin}/jq" "${mock_bin}/sleep" "${mock_bin}/id" "${mock_bin}/sed" "${mock_bin}/cp" "${mock_bin}/iptables"
-
-  if (
-    cd "${case_dir}"
-    PATH="${mock_bin}:${PATH}" UPDATE_TEST_CONTINUED_LOG="${continued_log}" \
-      bash "${case_dir}/update.sh" --dev --force --skip-start --skip-ping-check > "${update_output}" 2>&1
-  ); then
-    fail "update unexpectedly succeeded after MCP migration failure"
-  fi
-  grep -q 'MCP_ENCRYPTION_KEY must be set exactly once' "${update_output}" || fail "update did not report the MCP migration failure"
-  test ! -s "${continued_log}" || fail "update continued after MCP migration failure"
-  pass "update exits when MCP migration fails"
-}
-
 test_generators_delegate_to_shared_mcp_migration() {
   grep -qx 'source _modules/scripts/mcp_config.sh' "${REPO_DIR}/generate_config.sh" || fail "new-install generator does not load MCP migration helper"
   grep -qx 'mcp_prepare_config mailcow.conf new || exit 1' "${REPO_DIR}/generate_config.sh" || fail "new-install generator does not prepare MCP config"
   grep -q 'source "${NEW_OPTIONS_DIR}/mcp_config.sh"' "${REPO_DIR}/_modules/scripts/new_options.sh" || fail "upgrade options do not load MCP migration helper"
-  grep -qx '  mcp_prepare_config mailcow.conf upgrade || return 1' "${REPO_DIR}/_modules/scripts/new_options.sh" || fail "upgrade options do not prepare MCP config"
+  grep -qx '    mcp_prepare_config mailcow.conf upgrade || return 1' "${REPO_DIR}/_modules/scripts/new_options.sh" || fail "upgrade options do not prepare MCP config"
   pass "new and upgrade generators delegate to the shared MCP migration"
 }
 
@@ -308,5 +223,4 @@ test_versioned_config_repairs_secret_file_permissions
 test_profile_helpers_match_exact_tokens
 test_interrupted_rename_leaves_existing_config_intact
 test_new_install_marks_offer_handled
-test_update_exits_when_mcp_migration_fails
 test_generators_delegate_to_shared_mcp_migration
