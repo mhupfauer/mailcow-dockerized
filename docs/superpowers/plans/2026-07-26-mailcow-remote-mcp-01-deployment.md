@@ -52,7 +52,8 @@ Compose profiles, Bash, Python/Jinja nginx bootstrap.
 
 - [ ] **Step 1: Create package metadata and the failing configuration test**
 
-Use the exact direct dependency pins from the roadmap and scripts:
+Use the direct dependency pins from the roadmap after verifying each against
+the npm registry as the roadmap's pin policy requires, plus these scripts:
 
 ```json
 {
@@ -114,8 +115,9 @@ WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-pro
 
 Use a two-stage Dockerfile with
 `node:24.18.0-alpine3.24`, `npm ci`, non-root UID/GID `10001`, read-only
-application files, `NODE_ENV=production`, and a `HEALTHCHECK` against
-`http://127.0.0.1:3000/health/ready`.
+application files, `NODE_ENV=production`, and a `HEALTHCHECK` that probes
+`http://127.0.0.1:3000/health/ready` with busybox
+`wget -q --spider` — the alpine image ships no curl.
 
 - [ ] **Step 4: Run focused tests, typecheck, and image build**
 

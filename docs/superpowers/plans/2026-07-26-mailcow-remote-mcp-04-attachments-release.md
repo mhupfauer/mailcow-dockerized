@@ -295,6 +295,11 @@ and the upload token appears only in result `_meta`. For a client without the
 MCP Apps extension, assert a separately issued browser fallback URL appears in
 text. Both modes must retain meaningful text content.
 
+Test `upload-app.html` itself in a real browser context with Playwright
+against a stubbed MCP App postMessage bridge: assert file selection, a direct
+POST to the issued same-origin upload URL, progress and error rendering, and
+zero third-party requests.
+
 - [ ] **Step 2: Run and verify red**
 
 ```bash
@@ -460,6 +465,7 @@ mailcow.conf and MariaDB backup/restore requirements
 key-loss warning
 update --force/--skip-start behavior
 recovery after failed MCP migration
+prompt-injection threat model and reliance on client-side send confirmation
 ```
 
 Do not claim the MCP temp volume is durable backup data. Confirm the existing
@@ -480,6 +486,7 @@ discover protected resource -> register client -> PKCE login -> consent
 refresh after service restart
 list/search/read/create folder/move to Trash and Junk
 send text+HTML reply with CC/BCC
+verify the sent message appears in the mailbox Sent folder
 upload PDF and XLSX through inline App
 upload through standalone form
 upload 1 MiB base64 generated file

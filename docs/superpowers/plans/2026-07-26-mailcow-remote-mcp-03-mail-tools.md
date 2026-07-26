@@ -302,6 +302,11 @@ handle, CR/LF header rejection, malformed addresses, authenticated From/envelope
 enforcement, alias From rejection, max 100 recipients, partial rejection, total
 rejection, and ambiguous DATA-stage outcome with zero retry calls.
 
+Also cover the Sent copy: a definitive SMTP acceptance appends the composed
+MIME to the special-use Sent folder with the Seen flag; an append failure
+still returns a successful result with `sent_copy_saved: false`; total
+rejection and ambiguous outcomes perform no append.
+
 - [ ] **Step 2: Run and verify red**
 
 ```bash
@@ -326,6 +331,10 @@ From field by omitting it from the schema; set:
 Require `to`, `subject`, and one of `body_text`/`body_html`. Return accepted and
 rejected lists. If SMTP may have accepted DATA before disconnect, return
 `upstream_unavailable` with correlation ID and never auto-retry.
+
+After a definitive acceptance, call `ImapGateway.appendToSent` with the exact
+submitted MIME. Catch append errors, log them with the correlation ID, and
+set `sent_copy_saved: false` on the otherwise successful result.
 
 - [ ] **Step 4: Run send and MCP schema tests**
 
@@ -384,7 +393,9 @@ Expected: FAIL because centralized mapping/audit is absent.
 
 Wrap every handler with a common boundary. Hash opaque object IDs before
 auditing. Store recipient counts only. Add a daily cleanup that deletes audit
-rows older than `MCP_AUDIT_RETENTION_DAYS=30`.
+rows older than `MCP_AUDIT_RETENTION_DAYS=30`, deletes expired `oidc_objects`
+rows, and removes dynamically registered clients that hold no surviving grant
+thirty days after their last token activity.
 
 Register the same redacted audit boundary on OAuth registration, login,
 consent, token refresh/revocation, and upload-token issuance events so

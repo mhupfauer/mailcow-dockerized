@@ -51,6 +51,10 @@ bootstrap.
 - No permanent message deletion, IMAP expunge, administrator access,
   cross-mailbox access, alias sending, arbitrary URL attachments, or attachment
   execution.
+- After a definitive SMTP acceptance, append the sent message to the account's
+  special-use Sent folder; a failed append is reported as
+  `sent_copy_saved=false` on a successful result, never as a send failure. No
+  append occurs after an ambiguous SMTP outcome.
 - Default attachment limits are 10 MiB per attachment, 25 MiB encoded message,
   1 MiB decoded base64 tool input, and one-hour upload lifetime.
 - Commit after every task only when the task's focused tests and the phase
@@ -263,6 +267,7 @@ export interface ImapGateway {
   getMessage(ref: MessageRef, peek: true): Promise<MessageContent | null>;
   move(refs: MessageRef[], destination: string): Promise<void>;
   openAttachment(ref: AttachmentRef): Promise<NodeJS.ReadableStream>;
+  appendToSent(rawMessage: Buffer): Promise<void>;
 }
 
 export interface OutgoingMessage {
@@ -343,6 +348,12 @@ opening an upstream protocol connection.
 
 ## Dependency Pins
 
+The versions below were current when this plan was written. Before Phase 1
+Task 1, verify each against the npm registry; if a listed version does not
+exist or a newer release within the same major is current, use the latest
+stable release of that major instead. Never change a major version silently —
+stop and flag it. The lockfile is the source of truth once created.
+
 Create `package-lock.json` with `npm install --save-exact`; the direct pins are:
 
 ```json
@@ -385,7 +396,8 @@ MCP_DBNAME=mailcow_mcp
 MCP_DBUSER=mailcow_mcp
 MCP_DBPASS=<automatically-generated-64-character-hex-secret>
 MCP_ENCRYPTION_KEY=<automatically-generated-64-character-hex-key>
-MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback
+MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback
+MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=1
 MCP_ATTACHMENT_MAX_BYTES=10485760
 MCP_MESSAGE_MAX_BYTES=26214400
 MCP_BASE64_UPLOAD_MAX_BYTES=1048576

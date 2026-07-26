@@ -145,7 +145,9 @@ Version one uses:
 - Authorization codes with a two-minute lifetime and one-time consumption.
 - Resource indicators and an audience fixed to
   `https://${MAILCOW_HOSTNAME}/mcp`.
-- Scopes `mail.read`, `mail.send`, and `mail.organize`.
+- Scopes `mail.read`, `mail.send`, and `mail.organize`. An authorization
+  request that omits the `scope` parameter is treated as requesting all three
+  scopes, because many MCP clients send no scope parameter.
 - Persistent consent until the user disconnects the connector, revokes the
   grant, or revokes the app password.
 
@@ -153,9 +155,14 @@ Dynamic registration is enabled for Claude's zero-configuration connection
 flow but is constrained as follows:
 
 - Redirect URIs must exactly match an entry in
-  `MCP_OAUTH_ALLOWED_REDIRECT_URIS`.
-- The default allowed redirect URI is
-  `https://claude.ai/api/mcp/auth_callback`.
+  `MCP_OAUTH_ALLOWED_REDIRECT_URIS`, or, when
+  `MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=1` (the default), be an RFC 8252
+  loopback redirect: an `http` URI whose host is `127.0.0.1`, `[::1]`, or
+  `localhost`, with any port. This admits CLI clients such as Claude Code.
+  Non-loopback `http` redirect URIs are always rejected.
+- The default allowed redirect URIs are
+  `https://claude.ai/api/mcp/auth_callback` and
+  `https://claude.com/api/mcp/auth_callback`.
 - Only `authorization_code` and `refresh_token`, response type `code`, and
   `token_endpoint_auth_method=none` are accepted.
 - PKCE-S256 is mandatory.
@@ -179,9 +186,19 @@ the UI explicitly instructs users to provide a dedicated app password. The
 service cannot distinguish a normal password from an app password through
 IMAP/SMTP alone.
 
+A considered alternative was verifying submitted credentials directly against
+mailcow's `app_passwd` table, which would reject primary passwords by design
+and keep failed guesses away from Dovecot entirely. It was rejected for
+version one because it would grant the MCP service read access to mailcow's
+core authentication data and cross the deliberate database boundary that
+limits the service to its own `mailcow_mcp` schema.
+
 Failed logins are rate-limited by source IP and normalized mailbox before
 reaching Dovecot. Limits prevent credential stuffing and prevent repeated
-attempts from causing mailcow to ban the shared MCP container address.
+attempts from causing mailcow to ban the shared MCP container address. The
+rate limiter runs before any IMAP or SMTP connection is opened, and tests
+assert that no protocol attempt occurs once a source or mailbox is limited,
+keeping the MCP container below netfilter's ban thresholds.
 
 On success, the service creates an internal random account identifier. OAuth
 tokens use that identifier as the subject rather than exposing the mailbox
@@ -229,6 +246,11 @@ The database also holds:
 
 Opaque token identifiers and upload tokens are stored as one-way hashes. Raw
 bearer tokens and upload tokens exist only in the value returned to the client.
+
+A scheduled cleanup deletes expired `oidc-provider` rows and removes
+dynamically registered clients that hold no surviving grant thirty days after
+their last token activity, so abandoned registrations and expired OAuth
+artifacts do not accumulate indefinitely.
 
 The existing physical MariaDB volume backup includes this database. Temporary
 attachment files are intentionally excluded from durable backups.
@@ -361,6 +383,13 @@ characters. The tool returns the SMTP message ID plus explicit accepted and
 rejected recipient lists. Partial recipient rejection is not reported as
 complete success.
 
+After a definitive SMTP acceptance, the service appends the composed message
+to the account's special-use Sent folder with the Seen flag, so mail sent
+through MCP appears in the user's normal mail history. A failed append does
+not fail the tool call: the response still reports the send as successful and
+sets `sent_copy_saved` to false so the client can surface the missing Sent
+copy. No append is attempted after an ambiguous SMTP outcome.
+
 `send_email`, `create_folder`, and `move_messages` are annotated as write
 operations.
 
@@ -447,6 +476,13 @@ Email bodies and attachments are untrusted content. Tool descriptions and
 results explicitly identify them as untrusted user data, not instructions for
 the model.
 
+Combining mail reading with mail sending creates a prompt-injection
+exfiltration surface: a hostile inbound message can instruct a model to
+forward private data. Version one accepts this risk deliberately and
+documents it. The MCP client's interactive confirmation of write tools such
+as `send_email` is the operative control, and the administrator documentation
+states this explicitly rather than implying the server can prevent it.
+
 ## Rate Limits
 
 Defaults are configurable and enforced per account and source where relevant:
@@ -512,7 +548,8 @@ MCP_DBNAME=mailcow_mcp
 MCP_DBUSER=mailcow_mcp
 MCP_DBPASS=<automatically-generated-64-character-hex-secret>
 MCP_ENCRYPTION_KEY=<automatically-generated-64-character-hex-key>
-MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback
+MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback
+MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=1
 MCP_ATTACHMENT_MAX_BYTES=10485760
 MCP_MESSAGE_MAX_BYTES=26214400
 MCP_BASE64_UPLOAD_MAX_BYTES=1048576
@@ -727,6 +764,8 @@ and temporary volume only after the service is disabled; it is never called by
 - Single and batch moves, including Trash and Junk.
 - Direct sends with text, HTML, replies, CC/BCC, and partial recipient
   rejection.
+- Sent-folder append after definitive acceptance, success-with-warning on
+  append failure, and no append after rejection or an ambiguous outcome.
 - No retry after an ambiguous SMTP data-stage outcome.
 
 ### Attachment integration tests

@@ -24,8 +24,10 @@ crypto, ImapFlow, Nodemailer, Vitest/Testcontainers.
 - Apply every constraint in
   [the roadmap](2026-07-26-mailcow-remote-mcp-00-roadmap.md#global-constraints).
 - Dynamic clients are public clients restricted to exact configured HTTPS
-  redirect URIs, grant types `authorization_code` and `refresh_token`, response
-  type `code`, and `token_endpoint_auth_method=none`.
+  redirect URIs — plus RFC 8252 loopback `http` redirects while
+  `MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=1` — grant types `authorization_code`
+  and `refresh_token`, response type `code`, and
+  `token_endpoint_auth_method=none`.
 - Registration, login, and interaction routes are rate-limited before protocol
   authentication reaches Dovecot/Postfix.
 - OAuth tokens never contain mailbox addresses or app passwords.
@@ -237,7 +239,8 @@ git commit -m "feat: persist OAuth models in MariaDB"
 
 **Interfaces:**
 - Produces: `createOidcProvider(deps): Promise<Provider>`
-- Produces: `validateDynamicClient(metadata, allowedRedirectUris): void`
+- Produces:
+  `validateDynamicClient(metadata, allowedRedirectUris, allowLoopback): void`
 - Produces routes: `/oauth/auth`, `/oauth/token`, `/oauth/reg`,
   `/oauth/revocation`, `/oauth/jwks`, discovery
 
@@ -258,13 +261,19 @@ Post DCR bodies that must be rejected:
 {"token_endpoint_auth_method":"client_secret_basic"}
 ```
 
-Only the exact configured callback, a grant-type set containing
-`authorization_code` and no value outside
+Only an exactly configured callback or an allowed loopback redirect, a
+grant-type set containing `authorization_code` and no value outside
 `authorization_code|refresh_token`, response type code, and auth method none
-is accepted. A valid registration that omits `refresh_token` is normalized to
-store both allowed grants so issued rotating refresh tokens remain usable.
-Send eleven registration attempts from one IP and require the eleventh to
-return 429.
+is accepted. With `MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=1` (default), accept
+`http://127.0.0.1:33418/callback`, `http://[::1]:33418/callback`, and
+`http://localhost:33418/callback` with any port; always reject non-loopback
+`http` such as `http://192.168.1.10/cb`; with the toggle off, reject all
+loopback URIs. Both claude.ai and claude.com callbacks are accepted from the
+default configuration. A valid registration that omits `refresh_token` is
+normalized to store both allowed grants so issued rotating refresh tokens
+remain usable. An authorization request that omits the `scope` parameter must
+receive all three scopes. Send eleven registration attempts from one IP and
+require the eleventh to return 429.
 
 - [ ] **Step 2: Run and verify red**
 
@@ -368,7 +377,10 @@ Inject fake IMAP/SMTP authenticators and require both calls to use:
 Test IMAP fail, SMTP fail, both success, generic error copy, five login failures
 per IP/mailbox followed by 429, CSRF mismatch, unallowlisted return URL, secure
 cookie flags, consent limited to the three scopes, consent reuse, explicit grant
-revocation, and no secret in HTML/logs.
+revocation, and no secret in HTML/logs. After the rate limit trips, assert the
+fake IMAP/SMTP authenticators receive zero further connection attempts — the
+limiter must run before any protocol connection so mailcow netfilter never
+bans the shared MCP container address.
 
 - [ ] **Step 2: Run and verify red**
 
