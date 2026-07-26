@@ -137,7 +137,8 @@ limited to the authorization boundary.
 
 Version one uses:
 
-- Authorization Code grant only.
+- Authorization Code for interactive authorization plus the Refresh Token
+  grant for session continuation; no other grant types.
 - Mandatory PKCE-S256 for public clients.
 - Opaque access tokens with a 15-minute lifetime.
 - Rotating opaque refresh tokens with a 30-day maximum lifetime.
@@ -155,7 +156,7 @@ flow but is constrained as follows:
   `MCP_OAUTH_ALLOWED_REDIRECT_URIS`.
 - The default allowed redirect URI is
   `https://claude.ai/api/mcp/auth_callback`.
-- Only `authorization_code`, response type `code`, and
+- Only `authorization_code` and `refresh_token`, response type `code`, and
   `token_endpoint_auth_method=none` are accepted.
 - PKCE-S256 is mandatory.
 - Registration is rate-limited and audited.
