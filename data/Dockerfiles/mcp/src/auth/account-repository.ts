@@ -10,13 +10,18 @@ export interface StoredCredential {
 }
 
 export interface AccountRepository {
-  upsertVerified(mailbox: string, appPassword: string): Promise<string>;
+  upsertVerified(
+    mailbox: string,
+    appPassword: string,
+    activateAuthorization?: boolean,
+  ): Promise<string>;
   getCredential(accountId: string): Promise<StoredCredential | null>;
   markCredentialRejected(accountId: string): Promise<void>;
 }
 
 const credentialRecordType = "mailbox-credential";
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const uuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const atom = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+";
 const quotedString = '"(?:[ !#-\\[\\]-~]|\\\\[ -~])+"';
 const localPart = `(?:${atom}(?:\\.${atom})*|${quotedString})`;
@@ -109,7 +114,11 @@ export class MariaDbAccountRepository implements AccountRepository {
     private readonly vault: CredentialVault,
   ) {}
 
-  async upsertVerified(mailbox: string, appPassword: string): Promise<string> {
+  async upsertVerified(
+    mailbox: string,
+    appPassword: string,
+    activateAuthorization = true,
+  ): Promise<string> {
     const normalizedMailbox = normalizeMailbox(mailbox);
     const proposedId = randomUUID();
     const proposedIdBytes = uuidToBuffer(proposedId);
@@ -133,9 +142,17 @@ export class MariaDbAccountRepository implements AccountRepository {
         `INSERT INTO accounts (
           id, mailbox_normalized, credential_envelope, credential_version,
           created_at, updated_at, revoked_at
-        ) VALUES (?, ?, ?, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6), NULL)
+        ) VALUES (
+          ?, ?, ?, 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6),
+          IF(?, NULL, UTC_TIMESTAMP(6))
+        )
         ON DUPLICATE KEY UPDATE id = id`,
-        [proposedIdBytes, normalizedMailbox, proposedEnvelope],
+        [
+          proposedIdBytes,
+          normalizedMailbox,
+          proposedEnvelope,
+          activateAuthorization,
+        ],
       );
 
       const [rows] = await this.pool.execute<AccountRow[]>(
@@ -161,9 +178,10 @@ export class MariaDbAccountRepository implements AccountRepository {
       await this.pool.execute(
         `UPDATE accounts
         SET credential_envelope = ?, credential_version = 1,
-            updated_at = UTC_TIMESTAMP(6), revoked_at = NULL
+            updated_at = UTC_TIMESTAMP(6),
+            revoked_at = IF(?, NULL, revoked_at)
         WHERE id = ?`,
-        [envelope, uuidToBuffer(accountId)],
+        [envelope, activateAuthorization, uuidToBuffer(accountId)],
       );
 
       return accountId;

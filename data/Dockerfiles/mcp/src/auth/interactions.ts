@@ -8,7 +8,7 @@ import express, {
   type Router,
 } from "express";
 import type { Pool } from "mysql2/promise";
-import type { Provider } from "oidc-provider";
+import type { InteractionResults, Provider } from "oidc-provider";
 
 import {
   normalizeMailbox,
@@ -19,7 +19,10 @@ import {
   MariaDbConsentAuthorizationRepository,
   revokeProviderAuthority,
   revokeProviderAuthorityBestEffort,
+  type AccountAuthorizationGate,
+  type AuthorizationMutationCoordinator,
   type ConsentAuthorizationState,
+  type ReauthenticationProofStore,
 } from "./authorization-state.js";
 import type { CredentialVerifier } from "./credential-verifier.js";
 import { AesGcmCredentialVault } from "./crypto-vault.js";
@@ -30,7 +33,6 @@ const csrfCookieName = "mailcow_mcp_interaction_csrf";
 const csrfLifetimeSeconds = 600;
 const maximumFormBytes = 16 * 1_024;
 const defaultMaximumConsentSessions = 32;
-const defaultMaximumAuthorityMutations = 1_000;
 const allowedScopeSet = new Set<string>(MCP_OAUTH_SCOPES);
 
 interface InteractionDependencies {
@@ -46,8 +48,10 @@ interface InteractionDependencies {
   maximumInFlightInteractions?: number;
   maximumLoginQuotaEntries?: number;
   maximumConsentSessions?: number;
-  maximumAuthorityMutations?: number;
   verificationTimeoutMs?: number;
+  authorityMutations: AuthorizationMutationCoordinator;
+  reauthenticationProofs: ReauthenticationProofStore;
+  accountAuthorizationGate: AccountAuthorizationGate;
   now?: () => number;
 }
 
@@ -253,45 +257,6 @@ class BoundedInteractionLock {
           released = true;
           this.keys.delete(key);
         }
-      },
-    };
-  }
-}
-
-interface KeyedLockLease {
-  release(): void;
-}
-
-class BoundedKeyedLock {
-  private readonly tails = new Map<string, Promise<void>>();
-  private pending = 0;
-
-  constructor(private readonly maximum: number) {}
-
-  async acquire(key: string): Promise<KeyedLockLease | null> {
-    if (this.pending >= this.maximum) {
-      return null;
-    }
-    this.pending += 1;
-    const predecessor = this.tails.get(key) ?? Promise.resolve();
-    let releaseNext!: () => void;
-    const current = new Promise<void>((resolve) => {
-      releaseNext = resolve;
-    });
-    this.tails.set(key, current);
-    await predecessor;
-    let released = false;
-    return {
-      release: () => {
-        if (released) {
-          return;
-        }
-        released = true;
-        this.pending -= 1;
-        if (this.tails.get(key) === current) {
-          this.tails.delete(key);
-        }
-        releaseNext();
       },
     };
   }
@@ -547,6 +512,22 @@ function requestedScopes(
     : null;
 }
 
+function reauthenticationProof(lastSubmission: unknown): string | undefined {
+  if (
+    typeof lastSubmission !== "object" ||
+    lastSubmission === null ||
+    Array.isArray(lastSubmission)
+  ) {
+    return undefined;
+  }
+  const login = (lastSubmission as Record<string, unknown>).login;
+  if (typeof login !== "object" || login === null || Array.isArray(login)) {
+    return undefined;
+  }
+  const proof = (login as Record<string, unknown>).reauthenticationProof;
+  return typeof proof === "string" && proof !== "" ? proof : undefined;
+}
+
 async function finishConsent(
   request: Request,
   response: Response,
@@ -559,10 +540,11 @@ async function finishConsent(
   currentSessionId: string,
   consentRepository: MariaDbConsentAuthorizationRepository,
   maximumConsentSessions: number,
+  reauthenticationProofValue: string | undefined,
   consentScopes: readonly string[] = grantScopes,
 ): Promise<void> {
   const canonicalGrantId =
-    existingState?.reusable === true ? existingState.grantId : undefined;
+    existingState?.kind === "usable" ? existingState.grantId : undefined;
   let grant =
     canonicalGrantId === undefined
       ? undefined
@@ -574,7 +556,7 @@ async function finishConsent(
   grant.addResourceScope(dependencies.resource.href, grantScopes.join(" "));
   const savedGrantId = await grant.save();
   const sessionIds =
-    existingState?.reusable === true ? [...existingState.sessionIds] : [];
+    existingState?.kind === "usable" ? [...existingState.sessionIds] : [];
   if (!sessionIds.includes(currentSessionId)) {
     if (sessionIds.length >= maximumConsentSessions) {
       const evictedSessionId = sessionIds.shift();
@@ -589,10 +571,23 @@ async function finishConsent(
     sessionIds.push(currentSessionId);
   }
   try {
+    const reauthenticate =
+      reauthenticationProofValue !== undefined &&
+      dependencies.reauthenticationProofs.bindAndVerify(
+        reauthenticationProofValue,
+        accountId,
+        clientId,
+        dependencies.resource.href,
+        currentSessionId,
+      );
+    if (reauthenticationProofValue !== undefined && !reauthenticate) {
+      throw new InactiveAuthorizationAccountError();
+    }
     await consentRepository.save(accountId, clientId, {
       scopes: consentScopes,
       grantId: savedGrantId,
       sessionIds,
+      reauthenticate,
     });
   } catch (error) {
     if (error instanceof InactiveAuthorizationAccountError) {
@@ -624,11 +619,12 @@ async function finishConsent(
 
 function unsafeStoredAuthority(
   state: ConsentAuthorizationState | null,
+  hasReauthenticationProof: boolean,
 ): boolean {
   return (
     state !== null &&
-    !(state.active && state.reusable) &&
-    !state.replacementAllowed
+    !(state.active && state.kind === "usable") &&
+    !(state.revoked && hasReauthenticationProof)
   );
 }
 
@@ -639,7 +635,15 @@ async function quarantineUnsafeAuthority(
   clientId: string,
   currentGrantId: string | undefined,
   currentSessionId: string,
+  invalidateProofs: boolean,
 ): Promise<void> {
+  if (invalidateProofs) {
+    dependencies.reauthenticationProofs.invalidateAuthority(
+      accountId,
+      clientId,
+      dependencies.resource.href,
+    );
+  }
   await dependencies.accountRepository.markCredentialRejected(accountId);
   await consentRepository.revoke(accountId, clientId);
   await revokeProviderAuthorityBestEffort(
@@ -660,6 +664,11 @@ async function finishRevocation(
   currentGrantId: string | undefined,
   currentSessionId: string,
 ): Promise<void> {
+  dependencies.reauthenticationProofs.invalidateAuthority(
+    accountId,
+    clientId,
+    dependencies.resource.href,
+  );
   await revokeProviderAuthority(
     dependencies.provider,
     [
@@ -710,8 +719,6 @@ export function createInteractionRouter(
   const verificationTimeoutMs = dependencies.verificationTimeoutMs ?? 15_000;
   const maximumConsentSessions =
     dependencies.maximumConsentSessions ?? defaultMaximumConsentSessions;
-  const maximumAuthorityMutations =
-    dependencies.maximumAuthorityMutations ?? defaultMaximumAuthorityMutations;
   if (
     !Number.isSafeInteger(dependencies.loginAttempts) ||
     dependencies.loginAttempts < 1 ||
@@ -724,9 +731,7 @@ export function createInteractionRouter(
     !Number.isSafeInteger(verificationTimeoutMs) ||
     verificationTimeoutMs < 1 ||
     !Number.isSafeInteger(maximumConsentSessions) ||
-    maximumConsentSessions < 1 ||
-    !Number.isSafeInteger(maximumAuthorityMutations) ||
-    maximumAuthorityMutations < 1
+    maximumConsentSessions < 1
   ) {
     throw new Error("invalid login rate limit");
   }
@@ -742,13 +747,10 @@ export function createInteractionRouter(
   const interactionLock = new BoundedInteractionLock(
     maximumInFlightInteractions,
   );
-  const authorityLock = new BoundedKeyedLock(maximumAuthorityMutations);
   const consentRepository = new MariaDbConsentAuthorizationRepository(
     dependencies.pool,
     new AesGcmCredentialVault(dependencies.encryptionKey),
   );
-  const authorityKey = (accountId: string, clientId: string) =>
-    `${accountId}\u0000${clientId}\u0000${dependencies.resource.href}`;
 
   const precheckIp: RequestHandler = (request, response, next) => {
     const ip = requestIp(request);
@@ -825,8 +827,10 @@ export function createInteractionRouter(
         reject(response, 400, "Invalid interaction.");
         return;
       }
-      const authorityLease = await authorityLock.acquire(
-        authorityKey(accountId, clientId),
+      const authorityLease = await dependencies.authorityMutations.acquire(
+        accountId,
+        clientId,
+        dependencies.resource.href,
       );
       if (authorityLease === null) {
         reject(response, 503, "Authorization service is busy.");
@@ -837,7 +841,23 @@ export function createInteractionRouter(
           accountId,
           clientId,
         );
-        if (unsafeStoredAuthority(storedState)) {
+        const proof = reauthenticationProof(details.lastSubmission);
+        const hasReauthenticationProof =
+          proof !== undefined &&
+          dependencies.reauthenticationProofs.bindAndVerify(
+            proof,
+            accountId,
+            clientId,
+            dependencies.resource.href,
+            sessionId,
+          );
+        if (
+          storedState === null &&
+          !hasReauthenticationProof &&
+          !(await dependencies.accountAuthorizationGate.isAccountActive(
+            accountId,
+          ))
+        ) {
           await quarantineUnsafeAuthority(
             dependencies,
             consentRepository,
@@ -845,12 +865,26 @@ export function createInteractionRouter(
             clientId,
             details.grantId,
             sessionId,
+            false,
+          );
+          reject(response, 401, "Reconnect mailbox access.");
+          return;
+        }
+        if (unsafeStoredAuthority(storedState, hasReauthenticationProof)) {
+          await quarantineUnsafeAuthority(
+            dependencies,
+            consentRepository,
+            accountId,
+            clientId,
+            details.grantId,
+            sessionId,
+            storedState?.revoked !== true,
           );
           reject(response, 401, "Reconnect mailbox access.");
           return;
         }
         const existingState =
-          storedState?.active === true && storedState.reusable
+          storedState?.active === true && storedState.kind === "usable"
             ? storedState
             : null;
         if (
@@ -869,8 +903,18 @@ export function createInteractionRouter(
             sessionId,
             consentRepository,
             maximumConsentSessions,
+            hasReauthenticationProof ? proof : undefined,
             existingState.scopes,
           );
+          if (hasReauthenticationProof) {
+            dependencies.reauthenticationProofs.consume(
+              proof as string,
+              accountId,
+              clientId,
+              dependencies.resource.href,
+              sessionId,
+            );
+          }
           return;
         }
         renderConsent(response, csrf, scopes);
@@ -936,9 +980,12 @@ export function createInteractionRouter(
           return;
         }
         if (details.prompt.name === "login") {
+          const clientId = (details.params as Record<string, unknown>)
+            .client_id;
           const mailboxInput = body.mailbox;
           const appPassword = body.app_password;
           if (
+            typeof clientId !== "string" ||
             typeof mailboxInput !== "string" ||
             typeof appPassword !== "string" ||
             appPassword === ""
@@ -975,19 +1022,51 @@ export function createInteractionRouter(
             return;
           }
           reservation.release();
-          let accountId: string;
+          let accountId: string | undefined;
           try {
             accountId = await dependencies.accountRepository.upsertVerified(
               mailbox,
               appPassword,
+              false,
             );
+            const proof = dependencies.reauthenticationProofs.create(
+              accountId,
+              clientId,
+              dependencies.resource.href,
+            );
+            if (proof === null) {
+              await dependencies.accountRepository.markCredentialRejected(
+                accountId,
+              );
+              reject(response, 503, "Authentication service is busy.");
+              return;
+            }
             await dependencies.provider.interactionFinished(
               request,
               response,
-              { login: { accountId } },
+              {
+                login: {
+                  accountId,
+                  reauthenticationProof: proof,
+                },
+              } as InteractionResults,
               { mergeWithLastSubmission: false },
             );
           } catch {
+            if (accountId !== undefined) {
+              dependencies.reauthenticationProofs.invalidateAuthority(
+                accountId,
+                clientId,
+                dependencies.resource.href,
+              );
+              try {
+                await dependencies.accountRepository.markCredentialRejected(
+                  accountId,
+                );
+              } catch {
+                // The generic service response below must survive cleanup failure.
+              }
+            }
             reject(response, 503, "Authentication service is unavailable.");
           }
           return;
@@ -1011,8 +1090,10 @@ export function createInteractionRouter(
           reject(response, 400, "Invalid interaction.");
           return;
         }
-        const authorityLease = await authorityLock.acquire(
-          authorityKey(accountId, clientId),
+        const authorityLease = await dependencies.authorityMutations.acquire(
+          accountId,
+          clientId,
+          dependencies.resource.href,
         );
         if (authorityLease === null) {
           reject(response, 503, "Authorization service is busy.");
@@ -1023,7 +1104,37 @@ export function createInteractionRouter(
             accountId,
             clientId,
           );
-          if (unsafeStoredAuthority(storedState)) {
+          if (body.decision === "revoke" && storedState?.revoked === true) {
+            await finishRevocation(
+              request,
+              response,
+              dependencies,
+              consentRepository,
+              accountId,
+              clientId,
+              storedState,
+              details.grantId,
+              sessionId,
+            );
+            return;
+          }
+          const proof = reauthenticationProof(details.lastSubmission);
+          const hasReauthenticationProof =
+            proof !== undefined &&
+            dependencies.reauthenticationProofs.bindAndVerify(
+              proof,
+              accountId,
+              clientId,
+              dependencies.resource.href,
+              sessionId,
+            );
+          if (
+            storedState === null &&
+            !hasReauthenticationProof &&
+            !(await dependencies.accountAuthorizationGate.isAccountActive(
+              accountId,
+            ))
+          ) {
             await quarantineUnsafeAuthority(
               dependencies,
               consentRepository,
@@ -1031,6 +1142,20 @@ export function createInteractionRouter(
               clientId,
               details.grantId,
               sessionId,
+              false,
+            );
+            reject(response, 401, "Reconnect mailbox access.");
+            return;
+          }
+          if (unsafeStoredAuthority(storedState, hasReauthenticationProof)) {
+            await quarantineUnsafeAuthority(
+              dependencies,
+              consentRepository,
+              accountId,
+              clientId,
+              details.grantId,
+              sessionId,
+              storedState?.revoked !== true,
             );
             reject(response, 401, "Reconnect mailbox access.");
             return;
@@ -1054,7 +1179,7 @@ export function createInteractionRouter(
             return;
           }
           const existingState =
-            storedState?.active === true && storedState.reusable
+            storedState?.active === true && storedState.kind === "usable"
               ? storedState
               : null;
           const existingScopes = existingState?.scopes ?? [];
@@ -1073,8 +1198,18 @@ export function createInteractionRouter(
             sessionId,
             consentRepository,
             maximumConsentSessions,
+            hasReauthenticationProof ? proof : undefined,
             persistedScopes,
           );
+          if (hasReauthenticationProof) {
+            dependencies.reauthenticationProofs.consume(
+              proof as string,
+              accountId,
+              clientId,
+              dependencies.resource.href,
+              sessionId,
+            );
+          }
         } catch (error) {
           if (!response.headersSent) {
             reject(

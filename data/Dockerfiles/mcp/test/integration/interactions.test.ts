@@ -19,6 +19,8 @@ import {
 import { createApp } from "../../src/app.js";
 import { MariaDbAccountRepository } from "../../src/auth/account-repository.js";
 import {
+  BoundedAuthorizationMutationCoordinator,
+  BoundedReauthenticationProofStore,
   MariaDbAccountAuthorizationGate,
   MariaDbAccountAuthorizationRevoker,
   MariaDbConsentAuthorizationRepository,
@@ -219,6 +221,8 @@ describe("mailcow app-password interactions", () => {
   let verificationStarted: (() => void) | undefined;
   let accountRepository: MariaDbAccountRepository;
   let credentialVerifier: CredentialVerifier;
+  let authorityMutations: BoundedAuthorizationMutationCoordinator;
+  let reauthenticationProofs: BoundedReauthenticationProofStore;
 
   beforeAll(async () => {
     container = await new GenericContainer("mariadb:10.11")
@@ -285,6 +289,9 @@ describe("mailcow app-password interactions", () => {
       maximumLoginQuotaEntries?: number;
       maximumConsentSessions?: number;
       maximumAuthorityMutations?: number;
+      maximumReauthenticationProofs?: number;
+      reauthenticationProofTtlMs?: number;
+      proofNow?: () => number;
       verificationTimeoutMs?: number;
     } = {},
   ): Promise<void> {
@@ -293,6 +300,21 @@ describe("mailcow app-password interactions", () => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
     }
+    const {
+      maximumAuthorityMutations = 1_000,
+      maximumReauthenticationProofs = 10_000,
+      reauthenticationProofTtlMs = 10 * 60 * 1_000,
+      proofNow,
+      ...interactionOverrides
+    } = overrides;
+    authorityMutations = new BoundedAuthorizationMutationCoordinator(
+      maximumAuthorityMutations,
+    );
+    reauthenticationProofs = new BoundedReauthenticationProofStore(
+      maximumReauthenticationProofs,
+      reauthenticationProofTtlMs,
+      proofNow,
+    );
     const app = createApp({
       readiness: async () => true,
       resourceMetadataUrl: new URL(
@@ -309,7 +331,10 @@ describe("mailcow app-password interactions", () => {
         encryptionKey,
         loginAttempts: 5,
         loginWindowSeconds: 900,
-        ...overrides,
+        authorityMutations,
+        reauthenticationProofs,
+        accountAuthorizationGate: new MariaDbAccountAuthorizationGate(pool),
+        ...interactionOverrides,
       },
     });
     server = app.listen(0);
@@ -772,6 +797,26 @@ describe("mailcow app-password interactions", () => {
     finished.mockRestore();
   });
 
+  test("returns a generic service failure when provider and rejection bookkeeping both fail", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const finished = vi
+      .spyOn(provider, "interactionFinished")
+      .mockRejectedValueOnce(new Error("provider unavailable"));
+    const rejected = vi
+      .spyOn(accountRepository, "markCredentialRejected")
+      .mockRejectedValueOnce(new Error("database unavailable"));
+
+    const response = await submitLogin(login.path, login.response);
+
+    expect(response.status).toBe(503);
+    expect(response.headers["cache-control"]).toContain("no-store");
+    expect(response.body).not.toContain("provider unavailable");
+    expect(response.body).not.toContain("database unavailable");
+    finished.mockRestore();
+    rejected.mockRestore();
+  });
+
   test("fails closed when the bounded login quota map is full", async () => {
     await startApp({ maximumLoginQuotaEntries: 1 });
     authenticationFailure = true;
@@ -796,6 +841,90 @@ describe("mailcow app-password interactions", () => {
     );
     expect(rejected.status).toBe(429);
     expect(protocolAttempts).toHaveLength(1);
+  });
+
+  test("fails closed when a session-bound reauthentication proof expires", async () => {
+    let proofTime = 0;
+    await startApp({
+      reauthenticationProofTtlMs: 10,
+      proofNow: () => proofTime,
+    });
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    expect(loggedIn.status).toBe(303);
+
+    proofTime = 11;
+    const resume = await client.get(locationPath(loggedIn));
+    const consentPath = locationPath(resume);
+    const rejected = await client.get(consentPath);
+
+    expect(rejected.status).toBe(401);
+    expect(rejected.headers["cache-control"]).toContain("no-store");
+  });
+
+  test("fails closed when the bounded reauthentication proof store is full", async () => {
+    await startApp({ maximumReauthenticationProofs: 1 });
+    const firstClientId = await registerClient();
+    const firstLogin = await loginPage(firstClientId);
+    const firstLoggedIn = await submitLogin(
+      firstLogin.path,
+      firstLogin.response,
+    );
+    expect(firstLoggedIn.status).toBe(303);
+
+    const secondClientId = await registerClient();
+    const secondClient = new HttpClient((server.address() as AddressInfo).port);
+    const secondLogin = await loginPageFor(secondClient, secondClientId);
+    const rejected = await secondClient.postForm(secondLogin.path, {
+      csrf: hidden(secondLogin.response.body, "csrf"),
+      mailbox: "second@example.test",
+      app_password: "app-password",
+    });
+
+    expect(rejected.status).toBe(503);
+    expect(rejected.headers["cache-control"]).toContain("no-store");
+    expect(protocolAttempts).toHaveLength(2);
+  });
+
+  test("invalidates a pending reauthentication proof during account-wide revocation", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    expect(loggedIn.status).toBe(303);
+    const [accountRows] = await pool.query<
+      Array<RowDataPacket & { accountId: string }>
+    >(
+      `SELECT LOWER(CONCAT(
+         SUBSTR(HEX(id), 1, 8), '-',
+         SUBSTR(HEX(id), 9, 4), '-',
+         SUBSTR(HEX(id), 13, 4), '-',
+         SUBSTR(HEX(id), 17, 4), '-',
+         SUBSTR(HEX(id), 21)
+       )) AS accountId
+       FROM accounts`,
+    );
+    const accountId = accountRows[0]?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    const revoker = new MariaDbAccountAuthorizationRevoker(
+      accountRepository,
+      new MariaDbConsentAuthorizationRepository(
+        pool,
+        new AesGcmCredentialVault(encryptionKey),
+      ),
+      provider,
+      authorityMutations,
+      reauthenticationProofs,
+      resource.href,
+    );
+
+    await revoker.revokeCredential(accountId as string);
+    const resume = await client.get(locationPath(loggedIn));
+    const consentPath = locationPath(resume);
+    const response = await client.get(consentPath);
+
+    expect(response.status).toBe(401);
+    expect(response.headers["cache-control"]).toContain("no-store");
   });
 
   test("counts oversized login bodies against the source quota before authentication", async () => {
@@ -975,7 +1104,7 @@ describe("mailcow app-password interactions", () => {
       accountId as string,
       clientId,
     );
-    expect(authorizationState?.reusable).toBe(true);
+    expect(authorizationState?.kind).toBe("usable");
     expect(authorizationState?.sessionIds.length).toBeGreaterThan(0);
     for (const sessionId of authorizationState?.sessionIds ?? []) {
       expect(rawConsent).not.toContain(sessionId);
@@ -1274,7 +1403,17 @@ describe("mailcow app-password interactions", () => {
     );
     const accountId = accountRows[0]?.accountId;
     expect(accountId).toBeTypeOf("string");
-    await accountRepository.markCredentialRejected(accountId as string);
+    await new MariaDbAccountAuthorizationRevoker(
+      accountRepository,
+      new MariaDbConsentAuthorizationRepository(
+        pool,
+        new AesGcmCredentialVault(encryptionKey),
+      ),
+      provider,
+      authorityMutations,
+      reauthenticationProofs,
+      resource.href,
+    ).revokeCredential(accountId as string);
     releaseSave();
     const rejected = await approval;
     save.mockRestore();
@@ -1317,6 +1456,123 @@ describe("mailcow app-password interactions", () => {
     expect(reapproved.status).toBe(303);
   });
 
+  test("serializes account-wide revocation behind an in-flight consent mutation without leaving authority", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(callback.headers.location as string).searchParams.get(
+      "code",
+    );
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    expect(accountId).toBeTypeOf("string");
+
+    const expansionClient = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const expansionLogin = await loginPageFor(
+      expansionClient,
+      clientId,
+      "mail.read mail.send",
+    );
+    const expansionLoggedIn = await expansionClient.postForm(
+      expansionLogin.path,
+      {
+        csrf: hidden(expansionLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      },
+    );
+    const expansionConsent = await reachConsentFor(
+      expansionClient,
+      expansionLoggedIn,
+    );
+    const originalSave = provider.Grant.prototype.save;
+    let releaseSave!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    let grantSaved!: () => void;
+    const saved = new Promise<void>((resolve) => {
+      grantSaved = resolve;
+    });
+    const save = vi
+      .spyOn(provider.Grant.prototype, "save")
+      .mockImplementation(async function (...args) {
+        const grantId = await originalSave.apply(this, args);
+        grantSaved();
+        await waiting;
+        return grantId;
+      });
+    const expansionApproval = expansionClient.postForm(expansionConsent.path, {
+      csrf: hidden(expansionConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    await saved;
+
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    );
+    const revoker = new MariaDbAccountAuthorizationRevoker(
+      accountRepository,
+      consentRepository,
+      provider,
+      authorityMutations,
+      reauthenticationProofs,
+      resource.href,
+    );
+    let revocationSettled = false;
+    const revocation = revoker
+      .revokeCredential(accountId as string)
+      .finally(() => {
+        revocationSettled = true;
+      });
+    const gate = new MariaDbAccountAuthorizationGate(pool);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (!(await gate.isAccountActive(accountId as string))) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(await gate.isAccountActive(accountId as string)).toBe(false);
+    expect(revocationSettled).toBe(false);
+
+    releaseSave();
+    const expansionResult = await expansionApproval;
+    await revocation;
+    save.mockRestore();
+
+    expect(expansionResult.status).toBe(401);
+    expect(await gate.isAccountActive(accountId as string)).toBe(false);
+    expect(
+      await consentRepository.getActive(accountId as string, clientId),
+    ).toBeNull();
+    const [authorityRows] = await pool.query<
+      Array<RowDataPacket & { model: string; count: number }>
+    >(
+      `SELECT model, COUNT(*) AS count
+       FROM oidc_objects
+       WHERE model IN (
+         'Grant',
+         'Session',
+         'AccessToken',
+         'RefreshToken',
+         'AuthorizationCode'
+       )
+       GROUP BY model`,
+    );
+    expect(authorityRows).toEqual([]);
+  });
+
   test("quarantines legacy consent until credential reauthentication", async () => {
     const clientId = await registerClient();
     const login = await loginPage(clientId, "mail.read");
@@ -1328,6 +1584,29 @@ describe("mailcow app-password interactions", () => {
     });
     expect(approved.status).toBe(303);
     await client.get(locationPath(approved));
+    const survivingSession = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const survivingLogin = await loginPageFor(
+      survivingSession,
+      clientId,
+      "mail.read",
+    );
+    const survivingLoggedIn = await survivingSession.postForm(
+      survivingLogin.path,
+      {
+        csrf: hidden(survivingLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      },
+    );
+    const survivingResume = await survivingSession.get(
+      locationPath(survivingLoggedIn),
+    );
+    const survivingConsent = await survivingSession.get(
+      locationPath(survivingResume),
+    );
+    await survivingSession.get(locationPath(survivingConsent));
     await pool.execute(`UPDATE consents SET scopes = JSON_ARRAY('mail.read')`);
 
     const freshSession = new HttpClient((server.address() as AddressInfo).port);
@@ -1390,6 +1669,12 @@ describe("mailcow app-password interactions", () => {
       mailbox: "user@example.test",
       app_password: "app-password",
     });
+    const oldExpansionStart = await survivingSession.get(
+      authPath(clientId, "mail.read mail.organize"),
+    );
+    const oldExpansionPath = locationPath(oldExpansionStart);
+    const oldExpansion = await survivingSession.get(oldExpansionPath);
+    expect(oldExpansion.status).toBe(401);
     const reauthConsent = await reachConsentFor(
       reauthenticated,
       reauthLoggedIn,
@@ -1451,6 +1736,101 @@ describe("mailcow app-password interactions", () => {
     );
     expect(quarantinedRows[0]?.scopes).toBe(tamperedRaw);
     expect(quarantinedRows[0]?.revoked).toBe(1);
+  });
+
+  test("quarantines a structurally malformed stored consent row without overwriting it", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    await client.get(locationPath(approved));
+    await pool.execute(
+      `UPDATE consents
+       SET scopes = JSON_OBJECT('unexpected', JSON_ARRAY('mail.read'))`,
+    );
+    const [malformedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    const malformedRaw = malformedRows[0]?.scopes;
+
+    const oldSession = new HttpClient((server.address() as AddressInfo).port);
+    const oldLogin = await loginPageFor(oldSession, clientId);
+    const oldLoggedIn = await oldSession.postForm(oldLogin.path, {
+      csrf: hidden(oldLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const oldResume = await oldSession.get(locationPath(oldLoggedIn));
+    const oldConsentPath = locationPath(oldResume);
+    const rejected = await oldSession.get(oldConsentPath);
+
+    expect(rejected.status).toBe(401);
+    const [quarantinedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(quarantinedRows[0]?.scopes).toBe(malformedRaw);
+    expect(quarantinedRows[0]?.revoked).toBe(1);
+  });
+
+  test("retries explicit cleanup from a revoked encrypted association before quarantine", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    await client.get(locationPath(approved));
+    const revocationStart = await client.get(
+      authPath(clientId, "mail.read mail.organize"),
+    );
+    const revocationPath = locationPath(revocationStart);
+    const revocation = await client.get(revocationPath);
+    const revokeForm = {
+      csrf: hidden(revocation.body, "csrf"),
+      decision: "revoke",
+    };
+    const originalFindSession = provider.Session.findByUid.bind(
+      provider.Session,
+    );
+    let sessionFinds = 0;
+    const findSession = vi
+      .spyOn(provider.Session, "findByUid")
+      .mockImplementation(async (sessionUid) => {
+        sessionFinds += 1;
+        if (sessionFinds === 3) {
+          throw new Error("session adapter unavailable");
+        }
+        return originalFindSession(sessionUid);
+      });
+
+    const unavailable = await client.postForm(revocationPath, revokeForm);
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers["cache-control"]).toContain("no-store");
+    const [retryRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(retryRows[0]?.revoked).toBe(1);
+    const retryRaw = retryRows[0]?.scopes;
+
+    const retried = await client.postForm(revocationPath, revokeForm);
+    findSession.mockRestore();
+    expect(retried.status).toBe(303);
+    expect(retried.headers["content-length"]).toBe("0");
+    const [completedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(completedRows[0]?.scopes).toBe(retryRaw);
+    expect(completedRows[0]?.revoked).toBe(1);
   });
 
   test("bounds remembered consent sessions and destroys the evicted provider session", async () => {
@@ -1576,6 +1956,9 @@ describe("mailcow app-password interactions", () => {
       accountRepository,
       consentRepository,
       provider,
+      authorityMutations,
+      reauthenticationProofs,
+      resource.href,
     );
     const revokeAccessToken = vi
       .spyOn(provider.AccessToken, "revokeByGrantId")

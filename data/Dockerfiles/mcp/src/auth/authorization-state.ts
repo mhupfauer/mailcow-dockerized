@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import type { Pool, RowDataPacket } from "mysql2/promise";
 import type { Provider } from "oidc-provider";
@@ -15,7 +15,7 @@ interface ConsentRow extends RowDataPacket {
   clientId: string;
   value: string;
   active: number;
-  replacementAllowed: number;
+  revoked: number;
 }
 
 interface StoredConsentV1 {
@@ -32,12 +32,13 @@ interface ConsentAuthorityV1 {
 }
 
 export interface ConsentAuthorizationState {
+  kind: "usable" | "unsafe";
+  clientId: string;
   scopes: string[];
   grantId?: string;
   sessionIds: string[];
-  reusable: boolean;
   active: boolean;
-  replacementAllowed: boolean;
+  revoked: boolean;
 }
 
 export class InactiveAuthorizationAccountError extends Error {
@@ -48,6 +49,230 @@ export class InactiveAuthorizationAccountError extends Error {
 
 export interface AccountAuthorizationGate {
   isAccountActive(accountId: string): Promise<boolean>;
+}
+
+export interface AuthorizationMutationLease {
+  release(): void;
+}
+
+export interface AuthorizationMutationCoordinator {
+  acquire(
+    accountId: string,
+    clientId: string,
+    resource: string,
+  ): Promise<AuthorizationMutationLease | null>;
+}
+
+export class BoundedAuthorizationMutationCoordinator implements AuthorizationMutationCoordinator {
+  private readonly tails = new Map<string, Promise<void>>();
+  private pending = 0;
+
+  constructor(private readonly maximum: number) {
+    if (!Number.isSafeInteger(maximum) || maximum < 1) {
+      throw new Error("invalid authorization mutation limit");
+    }
+  }
+
+  async acquire(
+    accountId: string,
+    clientId: string,
+    resource: string,
+  ): Promise<AuthorizationMutationLease | null> {
+    if (this.pending >= this.maximum) {
+      return null;
+    }
+    this.pending += 1;
+    const key = createHash("sha256")
+      .update(`${accountId}\u0000${clientId}\u0000${resource}`, "utf8")
+      .digest("base64url");
+    const predecessor = this.tails.get(key) ?? Promise.resolve();
+    let releaseNext!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseNext = resolve;
+    });
+    this.tails.set(key, current);
+    await predecessor;
+    let released = false;
+    return {
+      release: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.pending -= 1;
+        if (this.tails.get(key) === current) {
+          this.tails.delete(key);
+        }
+        releaseNext();
+      },
+    };
+  }
+}
+
+export interface ReauthenticationProofStore {
+  create(accountId: string, clientId: string, resource: string): string | null;
+  bindAndVerify(
+    proof: string,
+    accountId: string,
+    clientId: string,
+    resource: string,
+    sessionUid: string,
+  ): boolean;
+  consume(
+    proof: string,
+    accountId: string,
+    clientId: string,
+    resource: string,
+    sessionUid: string,
+  ): void;
+  invalidateAuthority(
+    accountId: string,
+    clientId: string,
+    resource: string,
+  ): void;
+  invalidateAccount(accountId: string): void;
+}
+
+interface ReauthenticationProof {
+  accountHash: string;
+  authorityHash: string;
+  sessionHash?: string;
+  expiresAt: number;
+}
+
+export class BoundedReauthenticationProofStore implements ReauthenticationProofStore {
+  private readonly proofs = new Map<string, ReauthenticationProof>();
+
+  constructor(
+    private readonly maximum: number,
+    private readonly ttlMs: number,
+    private readonly now: () => number = Date.now,
+  ) {
+    if (
+      !Number.isSafeInteger(maximum) ||
+      maximum < 1 ||
+      !Number.isSafeInteger(ttlMs) ||
+      ttlMs < 1
+    ) {
+      throw new Error("invalid reauthentication proof policy");
+    }
+  }
+
+  private hashes(
+    proof: string,
+    accountId: string,
+    clientId: string,
+    resource: string,
+    sessionUid = "",
+  ): {
+    accountHash: string;
+    authorityHash: string;
+    proofHash: string;
+    sessionHash: string;
+  } {
+    const accountHash = createHash("sha256")
+      .update(accountId, "utf8")
+      .digest("base64url");
+    const authorityHash = createHash("sha256")
+      .update(`${accountId}\u0000${clientId}\u0000${resource}`, "utf8")
+      .digest("base64url");
+    const proofHash = createHash("sha256")
+      .update(`${authorityHash}\u0000${proof}`, "utf8")
+      .digest("base64url");
+    const sessionHash = createHash("sha256")
+      .update(`${authorityHash}\u0000${sessionUid}`, "utf8")
+      .digest("base64url");
+    return { accountHash, authorityHash, proofHash, sessionHash };
+  }
+
+  private sweep(): void {
+    const currentTime = this.now();
+    for (const [proofHash, proof] of this.proofs) {
+      if (proof.expiresAt <= currentTime) {
+        this.proofs.delete(proofHash);
+      }
+    }
+  }
+
+  create(accountId: string, clientId: string, resource: string): string | null {
+    this.sweep();
+    if (this.proofs.size >= this.maximum) {
+      return null;
+    }
+    const proof = randomBytes(32).toString("base64url");
+    const { accountHash, authorityHash, proofHash } = this.hashes(
+      proof,
+      accountId,
+      clientId,
+      resource,
+    );
+    this.proofs.set(proofHash, {
+      accountHash,
+      authorityHash,
+      expiresAt: this.now() + this.ttlMs,
+    });
+    return proof;
+  }
+
+  bindAndVerify(
+    proof: string,
+    accountId: string,
+    clientId: string,
+    resource: string,
+    sessionUid: string,
+  ): boolean {
+    this.sweep();
+    const { proofHash, sessionHash } = this.hashes(
+      proof,
+      accountId,
+      clientId,
+      resource,
+      sessionUid,
+    );
+    const stored = this.proofs.get(proofHash);
+    if (
+      stored === undefined ||
+      (stored.sessionHash !== undefined && stored.sessionHash !== sessionHash)
+    ) {
+      return false;
+    }
+    stored.sessionHash = sessionHash;
+    return true;
+  }
+
+  consume(
+    proof: string,
+    accountId: string,
+    clientId: string,
+    resource: string,
+    sessionUid: string,
+  ): void {
+    this.proofs.delete(
+      this.hashes(proof, accountId, clientId, resource, sessionUid).proofHash,
+    );
+  }
+
+  invalidateAuthority(
+    accountId: string,
+    clientId: string,
+    resource: string,
+  ): void {
+    const { authorityHash } = this.hashes("", accountId, clientId, resource);
+    for (const [proofHash, proof] of this.proofs) {
+      if (proof.authorityHash === authorityHash) {
+        this.proofs.delete(proofHash);
+      }
+    }
+  }
+
+  invalidateAccount(accountId: string): void {
+    const { accountHash } = this.hashes("", accountId, "", "");
+    for (const [proofHash, proof] of this.proofs) {
+      if (proof.accountHash === accountHash) {
+        this.proofs.delete(proofHash);
+      }
+    }
+  }
 }
 
 function validAccountId(accountId: string): boolean {
@@ -141,18 +366,26 @@ export class MariaDbConsentAuthorizationRepository {
   private async parseRow(
     accountId: string,
     row: ConsentRow,
-  ): Promise<ConsentAuthorizationState | null> {
+  ): Promise<ConsentAuthorizationState> {
     const stored = parseStoredConsent(row.value);
     if (stored === null) {
-      return null;
+      return {
+        kind: "unsafe",
+        clientId: row.clientId,
+        scopes: [],
+        sessionIds: [],
+        active: row.active === 1,
+        revoked: row.revoked === 1,
+      };
     }
     if (stored.authorityEnvelope === undefined) {
       return {
+        kind: "unsafe",
+        clientId: row.clientId,
         scopes: stored.scopes,
         sessionIds: [],
-        reusable: false,
         active: row.active === 1,
-        replacementAllowed: row.replacementAllowed === 1,
+        revoked: row.revoked === 1,
       };
     }
     try {
@@ -166,20 +399,22 @@ export class MariaDbConsentAuthorizationRepository {
         throw new Error("invalid consent authority");
       }
       return {
+        kind: "usable",
+        clientId: row.clientId,
         scopes: stored.scopes,
         grantId: authority.grantId,
         sessionIds: [...new Set(authority.sessionIds)],
-        reusable: true,
         active: row.active === 1,
-        replacementAllowed: row.replacementAllowed === 1,
+        revoked: row.revoked === 1,
       };
     } catch {
       return {
+        kind: "unsafe",
+        clientId: row.clientId,
         scopes: stored.scopes,
         sessionIds: [],
-        reusable: false,
         active: row.active === 1,
-        replacementAllowed: row.replacementAllowed === 1,
+        revoked: row.revoked === 1,
       };
     }
   }
@@ -193,7 +428,7 @@ export class MariaDbConsentAuthorizationRepository {
     }
     const [rows] = await this.pool.execute<ConsentRow[]>(
       `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
-              1 AS active, 0 AS replacementAllowed
+              1 AS active, 0 AS revoked
        FROM consents c
        INNER JOIN accounts a ON a.id = c.account_id
        WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))
@@ -215,11 +450,7 @@ export class MariaDbConsentAuthorizationRepository {
     const [rows] = await this.pool.execute<ConsentRow[]>(
       `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
               (c.revoked_at IS NULL AND a.revoked_at IS NULL) AS active,
-              (
-                c.revoked_at IS NOT NULL
-                AND a.revoked_at IS NULL
-                AND a.updated_at > c.revoked_at
-              ) AS replacementAllowed
+              (c.revoked_at IS NOT NULL) AS revoked
        FROM consents c
        INNER JOIN accounts a ON a.id = c.account_id
        WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))
@@ -236,6 +467,7 @@ export class MariaDbConsentAuthorizationRepository {
       scopes: readonly string[];
       grantId: string;
       sessionIds: readonly string[];
+      reauthenticate?: boolean;
     },
   ): Promise<void> {
     if (!validAccountId(accountId)) {
@@ -268,15 +500,29 @@ export class MariaDbConsentAuthorizationRepository {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
-      const [accounts] = await connection.execute<RowDataPacket[]>(
-        `SELECT id
+      const [accounts] = await connection.execute<
+        Array<RowDataPacket & { revoked: number }>
+      >(
+        `SELECT id, (revoked_at IS NOT NULL) AS revoked
          FROM accounts
-         WHERE id = UNHEX(REPLACE(?, '-', '')) AND revoked_at IS NULL
+         WHERE id = UNHEX(REPLACE(?, '-', ''))
          FOR UPDATE`,
         [accountId],
       );
-      if (accounts[0] === undefined) {
+      const account = accounts[0];
+      if (
+        account === undefined ||
+        (account.revoked === 1 && state.reauthenticate !== true)
+      ) {
         throw new InactiveAuthorizationAccountError();
+      }
+      if (account.revoked === 1) {
+        await connection.execute(
+          `UPDATE accounts
+           SET revoked_at = NULL, updated_at = UTC_TIMESTAMP(6)
+           WHERE id = UNHEX(REPLACE(?, '-', ''))`,
+          [accountId],
+        );
       }
       await connection.execute(
         `INSERT INTO consents (
@@ -314,11 +560,7 @@ export class MariaDbConsentAuthorizationRepository {
     const [rows] = await this.pool.execute<ConsentRow[]>(
       `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
               (c.revoked_at IS NULL AND a.revoked_at IS NULL) AS active,
-              (
-                c.revoked_at IS NOT NULL
-                AND a.revoked_at IS NULL
-                AND a.updated_at > c.revoked_at
-              ) AS replacementAllowed
+              (c.revoked_at IS NOT NULL) AS revoked
        FROM consents c
        INNER JOIN accounts a ON a.id = c.account_id
        WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))`,
@@ -327,9 +569,7 @@ export class MariaDbConsentAuthorizationRepository {
     const states = await Promise.all(
       rows.map((row) => this.parseRow(accountId, row)),
     );
-    return states.filter(
-      (state): state is ConsentAuthorizationState => state !== null,
-    );
+    return states;
   }
 
   async revokeAll(accountId: string): Promise<void> {
@@ -417,18 +657,46 @@ export class MariaDbAccountAuthorizationRevoker {
     private readonly accountRepository: AccountRepository,
     private readonly consentRepository: MariaDbConsentAuthorizationRepository,
     private readonly provider: Provider,
+    private readonly authorityMutations: AuthorizationMutationCoordinator,
+    private readonly reauthenticationProofs: ReauthenticationProofStore,
+    private readonly resource: string,
   ) {}
 
   async revokeCredential(accountId: string): Promise<void> {
     await this.accountRepository.markCredentialRejected(accountId);
+    this.reauthenticationProofs.invalidateAccount(accountId);
     const states = await this.consentRepository.listStored(accountId);
-    await revokeProviderAuthorityBestEffort(
-      this.provider,
-      states.flatMap((state) =>
-        state.grantId === undefined ? [] : [state.grantId],
-      ),
-      states.flatMap((state) => state.sessionIds),
-    );
-    await this.consentRepository.revokeAll(accountId);
+    let cleanupFailed = false;
+    for (const state of states) {
+      this.reauthenticationProofs.invalidateAuthority(
+        accountId,
+        state.clientId,
+        this.resource,
+      );
+      const lease = await this.authorityMutations.acquire(
+        accountId,
+        state.clientId,
+        this.resource,
+      );
+      if (lease === null) {
+        cleanupFailed = true;
+        continue;
+      }
+      try {
+        await revokeProviderAuthorityBestEffort(
+          this.provider,
+          state.grantId === undefined ? [] : [state.grantId],
+          state.sessionIds,
+        );
+        await this.consentRepository.revoke(accountId, state.clientId);
+      } catch {
+        cleanupFailed = true;
+      } finally {
+        lease.release();
+      }
+    }
+    if (cleanupFailed) {
+      throw new Error("unable to revoke account authorization");
+    }
   }
 }
