@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import express from "express";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import type { Pool, RowDataPacket } from "mysql2/promise";
@@ -40,6 +41,9 @@ const issuer = new URL("https://mail.example.test");
 const resource = new URL("https://mail.example.test/mcp");
 const redirectUri = "https://claude.ai/api/mcp/auth_callback";
 const execFileAsync = promisify(execFile);
+const mailcowTestCertificate = fileURLToPath(
+  new URL("../../../../assets/ssl-example/cert.pem", import.meta.url),
+);
 
 interface HttpResponse {
   status: number;
@@ -508,6 +512,7 @@ describe("OAuth provider policy", () => {
         MCP_DBUSER: databaseUser,
         MCP_DBPASS: databasePassword,
         MCP_ENCRYPTION_KEY: encryptionKeyHex,
+        MCP_TLS_TRUST_PATH: mailcowTestCertificate,
       },
       { port: 0 },
     );
@@ -529,6 +534,23 @@ describe("OAuth provider policy", () => {
 
       const registration = await register(client);
       expect(registration.client_id).toBeTypeOf("string");
+
+      const loginStart = await client.get(
+        authorizationPath(registration.client_id as string, {
+          codeChallenge: "p".repeat(64),
+          codeChallengeMethod: "S256",
+          scope: "mail.read",
+        }),
+      );
+      expect(loginStart.status).toBe(303);
+      const loginLocation = new URL(
+        loginStart.headers.location as string,
+        issuer,
+      );
+      expect(loginLocation.pathname).toMatch(/^\/mcp-login\//u);
+      const login = await client.get(loginLocation.pathname);
+      expect(login.status).toBe(200);
+      expect(login.body).toContain("dedicated mailcow app password");
 
       const jwks = await client.get("/oauth/jwks");
       expect(jwks.status).toBe(200);

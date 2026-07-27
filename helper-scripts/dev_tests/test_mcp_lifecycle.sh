@@ -1208,6 +1208,8 @@ test_compose_forwards_mcp_oauth_policy_overrides() {
   local redirects="https://operator.example.test/oauth/callback,https://backup.example.test/callback?mode=manual"
   local allow_loopback="0"
   local registrations_per_hour="37"
+  local login_attempts="7"
+  local login_window_seconds="1200"
 
   mkdir -p "${case_dir}"
   write_config "${default_config}" mcp
@@ -1215,6 +1217,8 @@ test_compose_forwards_mcp_oauth_policy_overrides() {
     -e "s|^MCP_OAUTH_ALLOWED_REDIRECT_URIS=.*|MCP_OAUTH_ALLOWED_REDIRECT_URIS=${redirects}|" \
     -e "s|^MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=.*|MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=${allow_loopback}|" \
     -e "s|^MCP_REGISTRATIONS_PER_HOUR=.*|MCP_REGISTRATIONS_PER_HOUR=${registrations_per_hour}|" \
+    -e "s|^MCP_LOGIN_ATTEMPTS=.*|MCP_LOGIN_ATTEMPTS=${login_attempts}|" \
+    -e "s|^MCP_LOGIN_WINDOW_SECONDS=.*|MCP_LOGIN_WINDOW_SECONDS=${login_window_seconds}|" \
     "${default_config}" > "${override_config}"
   chmod 600 "${override_config}"
 
@@ -1222,7 +1226,9 @@ test_compose_forwards_mcp_oauth_policy_overrides() {
     unset \
       MCP_OAUTH_ALLOWED_REDIRECT_URIS \
       MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS \
-      MCP_REGISTRATIONS_PER_HOUR
+      MCP_REGISTRATIONS_PER_HOUR \
+      MCP_LOGIN_ATTEMPTS \
+      MCP_LOGIN_WINDOW_SECONDS
     docker compose \
       --env-file "${override_config}" \
       -f "${REPO_DIR}/docker-compose.yml" \
@@ -1241,6 +1247,8 @@ expected = {
     "MCP_OAUTH_ALLOWED_REDIRECT_URIS": sys.argv[1],
     "MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS": sys.argv[2],
     "MCP_REGISTRATIONS_PER_HOUR": sys.argv[3],
+    "MCP_LOGIN_ATTEMPTS": sys.argv[4],
+    "MCP_LOGIN_WINDOW_SECONDS": sys.argv[5],
 }
 actual = {key: environment.get(key) for key in expected}
 if actual != expected:
@@ -1248,7 +1256,22 @@ if actual != expected:
         "mcp-mailcow did not preserve OAuth policy overrides: "
         f"expected={expected!r}, actual={actual!r}"
     )
-' "${redirects}" "${allow_loopback}" "${registrations_per_hour}"; then
+volumes = config["services"]["mcp-mailcow"]["volumes"]
+trust_mounts = [
+    volume for volume in volumes
+    if volume.get("target") == "/etc/ssl/mail/cert.pem"
+]
+if (
+    len(trust_mounts) != 1
+    or not trust_mounts[0].get("read_only")
+    or not trust_mounts[0].get("source", "").endswith("/data/assets/ssl/cert.pem")
+):
+    raise SystemExit(
+        "mcp-mailcow does not mount only the mailcow certificate read-only: "
+        f"{trust_mounts!r}"
+    )
+' "${redirects}" "${allow_loopback}" "${registrations_per_hour}" \
+    "${login_attempts}" "${login_window_seconds}"; then
     fail "Compose did not forward MCP OAuth policy overrides unchanged"
   fi
 

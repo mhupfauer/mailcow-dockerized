@@ -1,8 +1,12 @@
 import type { Server } from "node:http";
+import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import type { Pool } from "mysql2/promise";
 
 import { createApp } from "./app.js";
+import { MariaDbAccountRepository } from "./auth/account-repository.js";
+import { DualProtocolCredentialVerifier } from "./auth/credential-verifier.js";
+import { AesGcmCredentialVault } from "./auth/crypto-vault.js";
 import { createOidcProvider } from "./auth/oidc-provider.js";
 import { loadConfig } from "./config.js";
 import { createPool } from "./db/pool.js";
@@ -67,6 +71,7 @@ export async function startProductionServer(
   options: StartProductionServerOptions = {},
 ): Promise<ProductionServer> {
   const config = loadConfig(env);
+  const trustSource = await readFile(config.tlsTrustPath);
   const pool = createPool({
     host: config.db.host,
     port: config.db.port,
@@ -83,6 +88,12 @@ export async function startProductionServer(
       encryptionKey: config.encryptionKey,
       env,
     });
+    const vault = new AesGcmCredentialVault(config.encryptionKey);
+    const accountRepository = new MariaDbAccountRepository(pool, vault);
+    const credentialVerifier = new DualProtocolCredentialVerifier({
+      hostname: config.hostname,
+      ca: trustSource,
+    });
     const app = createApp({
       readiness: async () => {
         await pool.query("SELECT 1");
@@ -91,6 +102,16 @@ export async function startProductionServer(
       resourceMetadataUrl: config.resourceMetadataUrl,
       oidcProvider,
       registrationsPerHour: config.registrationsPerHour,
+      interactions: {
+        accountRepository,
+        credentialVerifier,
+        pool,
+        issuer: config.issuer,
+        resource: config.resource,
+        encryptionKey: config.encryptionKey,
+        loginAttempts: config.loginAttempts,
+        loginWindowSeconds: config.loginWindowSeconds,
+      },
     });
     const server = await listen(app, options.port ?? config.port);
 

@@ -20,6 +20,9 @@ describe("loadConfig", () => {
       ...validEnvironment,
       MCP_DBPORT: "3307",
       MCP_REGISTRATIONS_PER_HOUR: "12",
+      MCP_LOGIN_ATTEMPTS: "7",
+      MCP_LOGIN_WINDOW_SECONDS: "1200",
+      MCP_TLS_TRUST_PATH: "/test/mailcow-cert.pem",
     });
 
     expect(config.encryptionKey).toEqual(
@@ -33,10 +36,21 @@ describe("loadConfig", () => {
     );
     expect(config.db.port).toBe(3307);
     expect(config.registrationsPerHour).toBe(12);
+    expect(config.loginAttempts).toBe(7);
+    expect(config.loginWindowSeconds).toBe(1200);
+    expect(config.tlsTrustPath).toBe("/test/mailcow-cert.pem");
     expect(config.resource.href).toBe("https://mail.example.test/mcp");
     expect(config.resourceMetadataUrl.href).toBe(
       "https://mail.example.test/.well-known/oauth-protected-resource/mcp",
     );
+  });
+
+  test("uses the mounted mailcow certificate and reviewed login limits by default", () => {
+    const config = loadConfig(validEnvironment);
+
+    expect(config.loginAttempts).toBe(5);
+    expect(config.loginWindowSeconds).toBe(900);
+    expect(config.tlsTrustPath).toBe("/etc/ssl/mail/cert.pem");
   });
 
   test("rejects a 63-character encryption key", () => {

@@ -706,8 +706,11 @@ services:
         - MCP_OAUTH_ALLOWED_REDIRECT_URIS=${MCP_OAUTH_ALLOWED_REDIRECT_URIS}
         - MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=${MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS}
         - MCP_REGISTRATIONS_PER_HOUR=${MCP_REGISTRATIONS_PER_HOUR}
+        - MCP_LOGIN_ATTEMPTS=${MCP_LOGIN_ATTEMPTS}
+        - MCP_LOGIN_WINDOW_SECONDS=${MCP_LOGIN_WINDOW_SECONDS}
       volumes:
         - mcp-attachments-vol-1:/var/lib/mailcow-mcp/attachments
+        - ./data/assets/ssl/cert.pem:/etc/ssl/mail/cert.pem:ro,z
       networks:
         mailcow-network:
           aliases:

@@ -5,6 +5,10 @@ import express, {
 } from "express";
 import type { Provider } from "oidc-provider";
 
+import {
+  createInteractionRouter,
+  type InteractionDependencies,
+} from "./auth/interactions.js";
 import { createIpRateLimiter } from "./http/rate-limit.js";
 
 interface AppDependencies {
@@ -12,6 +16,7 @@ interface AppDependencies {
   resourceMetadataUrl: URL;
   oidcProvider?: Provider;
   registrationsPerHour?: number;
+  interactions?: Omit<InteractionDependencies, "provider">;
 }
 
 const registrationPath = "/oauth/reg";
@@ -95,6 +100,14 @@ export function createApp(deps: AppDependencies): Express {
       continueToProvider,
       normalizeRegistrationBodyError,
     );
+    if (deps.interactions !== undefined) {
+      app.use(
+        createInteractionRouter({
+          ...deps.interactions,
+          provider: deps.oidcProvider,
+        }),
+      );
+    }
     app.use(deps.oidcProvider.callback());
   }
 

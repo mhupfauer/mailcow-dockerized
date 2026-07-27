@@ -5,6 +5,9 @@ export interface AppConfig {
   resourceMetadataUrl: URL;
   port: number;
   registrationsPerHour: number;
+  loginAttempts: number;
+  loginWindowSeconds: number;
+  tlsTrustPath: string;
   db: {
     host: string;
     port: number;
@@ -99,6 +102,20 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       10,
       "MCP_REGISTRATIONS_PER_HOUR",
     ),
+    loginAttempts: positiveInteger(
+      env.MCP_LOGIN_ATTEMPTS,
+      5,
+      "MCP_LOGIN_ATTEMPTS",
+    ),
+    loginWindowSeconds: positiveInteger(
+      env.MCP_LOGIN_WINDOW_SECONDS,
+      900,
+      "MCP_LOGIN_WINDOW_SECONDS",
+    ),
+    tlsTrustPath:
+      env.MCP_TLS_TRUST_PATH === undefined
+        ? "/etc/ssl/mail/cert.pem"
+        : required(env, "MCP_TLS_TRUST_PATH"),
     db: {
       host: required(env, "MCP_DBHOST"),
       port: parseDatabasePort(env.MCP_DBPORT ?? "3306"),
