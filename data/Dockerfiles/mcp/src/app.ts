@@ -1,11 +1,21 @@
-import express, { type Express } from "express";
+import express, {
+  type ErrorRequestHandler,
+  type Express,
+  type RequestHandler,
+} from "express";
 import type { Provider } from "oidc-provider";
+
+import { createIpRateLimiter } from "./http/rate-limit.js";
 
 interface AppDependencies {
   readiness(): Promise<boolean>;
   resourceMetadataUrl: URL;
   oidcProvider?: Provider;
+  registrationsPerHour?: number;
 }
+
+const registrationPath = "/oauth/reg";
+const registrationWindowMs = 60 * 60 * 1_000;
 
 export function createApp(deps: AppDependencies): Express {
   const app = express();
@@ -34,10 +44,56 @@ export function createApp(deps: AppDependencies): Express {
   if (deps.oidcProvider !== undefined) {
     deps.oidcProvider.proxy = true;
     deps.oidcProvider.maxIpsCount = 1;
+    const registrationLimiter = createIpRateLimiter({
+      limit: deps.registrationsPerHour ?? 10,
+      windowMs: registrationWindowMs,
+    });
+    const limitRegistration: RequestHandler = (request, response, next) => {
+      const decision = registrationLimiter.consume(
+        request.ip ?? request.socket.remoteAddress ?? "",
+      );
+      if (decision.allowed) {
+        next();
+        return;
+      }
+      response.set("Retry-After", decision.retryAfter.toString());
+      response.status(429).json({
+        error: "too_many_requests",
+        error_description: "registration rate limit exceeded",
+      });
+    };
+    const normalizeRegistrationBodyError: ErrorRequestHandler = (
+      error,
+      _request,
+      response,
+      _next,
+    ) => {
+      const status =
+        typeof error === "object" &&
+        error !== null &&
+        "status" in error &&
+        error.status === 413
+          ? 413
+          : 400;
+      response.status(status).json({
+        error: "invalid_client_metadata",
+        error_description:
+          status === 413
+            ? "registration body is too large"
+            : "registration body is invalid",
+      });
+    };
+    const continueToProvider: RequestHandler = (
+      _request,
+      _response,
+      next,
+    ) => next();
     app.post(
-      "/oauth/reg",
+      registrationPath,
+      limitRegistration,
       express.json({ limit: "56kb", strict: true }),
-      (_request, _response, next) => next(),
+      continueToProvider,
+      normalizeRegistrationBodyError,
     );
     app.use(deps.oidcProvider.callback());
   }

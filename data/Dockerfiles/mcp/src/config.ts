@@ -4,7 +4,14 @@ export interface AppConfig {
   resource: URL;
   resourceMetadataUrl: URL;
   port: number;
-  db: { host: string; name: string; user: string; password: string };
+  registrationsPerHour: number;
+  db: {
+    host: string;
+    port: number;
+    name: string;
+    user: string;
+    password: string;
+  };
   encryptionKey: Buffer;
 }
 
@@ -31,6 +38,38 @@ function parsePort(value: string): number {
   return port;
 }
 
+function parseDatabasePort(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error("MCP_DBPORT must be an integer between 1 and 65535");
+  }
+
+  const port = Number(value);
+  if (port < 1 || port > 65_535) {
+    throw new Error("MCP_DBPORT must be an integer between 1 and 65535");
+  }
+
+  return port;
+}
+
+function positiveInteger(
+  value: string | undefined,
+  fallback: number,
+  variableName: string,
+): number {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (!/^[1-9][0-9]*$/u.test(value)) {
+    throw new Error(`${variableName} must be a positive integer`);
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${variableName} must be a positive integer`);
+  }
+  return parsed;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
   const hostname = required(env, "MAILCOW_HOSTNAME");
   const encryptionKey = required(env, "MCP_ENCRYPTION_KEY");
@@ -55,8 +94,14 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
       issuer,
     ),
     port: parsePort(required(env, "MCP_PORT")),
+    registrationsPerHour: positiveInteger(
+      env.MCP_REGISTRATIONS_PER_HOUR,
+      10,
+      "MCP_REGISTRATIONS_PER_HOUR",
+    ),
     db: {
       host: required(env, "MCP_DBHOST"),
+      port: parseDatabasePort(env.MCP_DBPORT ?? "3306"),
       name: required(env, "MCP_DBNAME"),
       user: required(env, "MCP_DBUSER"),
       password: databasePassword,

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { AdapterPayload } from "oidc-provider";
+import { errors, type AdapterPayload } from "oidc-provider";
 import type { Pool, RowDataPacket } from "mysql2/promise";
 import { GenericContainer } from "testcontainers";
 import {
@@ -301,7 +301,7 @@ describe("MariaDbOidcAdapter", () => {
     }
   });
 
-  test("consume records one database timestamp once and exposes it through find without mutating the input", async () => {
+  test("consume permits one active claim and rejects concurrent or repeated claims", async () => {
     const id = "consume-once-authorization-code";
     const payload: AdapterPayload = {
       kind: "AuthorizationCode",
@@ -312,18 +312,31 @@ describe("MariaDbOidcAdapter", () => {
     const adapter = MariaDbOidcAdapter.factory(pool)("AuthorizationCode");
 
     await adapter.upsert(id, payload, 120);
-    await Promise.all([
+    const concurrent = await Promise.allSettled([
       adapter.consume(id),
       adapter.consume(id),
       adapter.consume(id),
     ]);
+    expect(
+      concurrent.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    const rejected = concurrent.filter(
+      (result): result is PromiseRejectedResult =>
+        result.status === "rejected",
+    );
+    expect(rejected).toHaveLength(2);
+    for (const result of rejected) {
+      expect(result.reason).toBeInstanceOf(errors.InvalidGrant);
+    }
     const first = await adapter.find(id);
     const [firstRows] = await pool.query<ConsumedRow[]>(
       "SELECT consumed_at AS consumedAt FROM oidc_objects",
     );
 
     await new Promise((resolve) => setTimeout(resolve, 10));
-    await adapter.consume(id);
+    await expect(adapter.consume(id)).rejects.toBeInstanceOf(
+      errors.InvalidGrant,
+    );
     const [secondRows] = await pool.query<ConsumedRow[]>(
       "SELECT consumed_at AS consumedAt FROM oidc_objects",
     );

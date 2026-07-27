@@ -28,11 +28,12 @@ import { AesGcmCredentialVault } from "../../src/auth/crypto-vault.js";
 import { initializeDatabase } from "../../src/db/init.js";
 import { runMigrations } from "../../src/db/migrations.js";
 import { createPool } from "../../src/db/pool.js";
+import { startProductionServer } from "../../src/server.js";
 
 const rootPassword = "root-password-for-oauth-policy-test";
 const databaseName = "mailcow_mcp";
 const databaseUser = "mailcow_mcp";
-const databasePassword = "database-password-for-oauth-policy-test";
+const databasePassword = "b".repeat(64);
 const encryptionKeyHex =
   "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f";
 const issuer = new URL("https://mail.example.test");
@@ -496,6 +497,60 @@ describe("OAuth provider policy", () => {
     }
   });
 
+  test("production entrypoint composes database-backed OAuth routes", async () => {
+    const production = await startProductionServer(
+      {
+        MAILCOW_HOSTNAME: issuer.hostname,
+        MCP_PORT: "3000",
+        MCP_DBHOST: host,
+        MCP_DBPORT: port.toString(),
+        MCP_DBNAME: databaseName,
+        MCP_DBUSER: databaseUser,
+        MCP_DBPASS: databasePassword,
+        MCP_ENCRYPTION_KEY: encryptionKeyHex,
+      },
+      { port: 0 },
+    );
+    const address = production.server.address() as AddressInfo;
+    const client = new HttpClient(address.port);
+    try {
+      const readiness = await client.get("/health/ready");
+      expect(readiness.status).toBe(200);
+
+      const discovery = await client.get(
+        "/.well-known/oauth-authorization-server",
+      );
+      expect(discovery.status).toBe(200);
+      expect(discovery.json()).toMatchObject({
+        authorization_endpoint: `${issuer.href}oauth/auth`,
+        token_endpoint: `${issuer.href}oauth/token`,
+        registration_endpoint: `${issuer.href}oauth/reg`,
+      });
+
+      const registration = await register(client);
+      expect(registration.client_id).toBeTypeOf("string");
+
+      const jwks = await client.get("/oauth/jwks");
+      expect(jwks.status).toBe(200);
+      expect(record(jwks.json()).keys).toBeInstanceOf(Array);
+
+      const token = await client.postForm(
+        "/oauth/token",
+        new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: registration.client_id as string,
+          code: "not-a-real-code",
+          redirect_uri: redirectUri,
+          code_verifier: "v".repeat(64),
+        }),
+      );
+      expect(token.status).toBe(400);
+      expect(token.json()).toMatchObject({ error: "invalid_grant" });
+    } finally {
+      await production.close();
+    }
+  });
+
   test.each([
     ["unapproved host", { redirect_uris: ["https://evil.example/cb"] }],
     [
@@ -689,6 +744,56 @@ describe("OAuth provider policy", () => {
         "SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Client'",
       );
       expect(rows[0]?.count).toBe(11);
+    } finally {
+      await running.close();
+    }
+  });
+
+  test("counts malformed, non-object, and oversized registration bodies before parsing", async () => {
+    const running = await startServer(provider);
+    const forwardedClient = {
+      "content-type": "application/json",
+      "x-forwarded-for": "198.51.100.250, 203.0.113.20",
+    };
+    const invalidBodies = [
+      { body: "{", status: 400 },
+      { body: "[]", status: 400 },
+      { body: JSON.stringify("not-an-object"), status: 400 },
+      {
+        body: JSON.stringify({ padding: "x".repeat(60 * 1_024) }),
+        status: 413,
+      },
+    ];
+    try {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const invalid = invalidBodies[attempt % invalidBodies.length]!;
+        const response = await running.client.request("/oauth/reg", {
+          method: "POST",
+          headers: forwardedClient,
+          body: invalid.body,
+        });
+
+        expect(response.status).toBe(invalid.status);
+        expect(response.body.length).toBeLessThan(512);
+        expect(response.json()).toMatchObject({
+          error: "invalid_client_metadata",
+        });
+      }
+
+      const rejected = await running.client.postJson(
+        "/oauth/reg",
+        validRegistration(),
+        { "x-forwarded-for": forwardedClient["x-forwarded-for"] },
+      );
+      expect(rejected.status).toBe(429);
+      expect(rejected.body.length).toBeLessThan(512);
+      expect(rejected.json()).toMatchObject({
+        error: "too_many_requests",
+      });
+      const [rows] = await pool.query<CountRow[]>(
+        "SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Client'",
+      );
+      expect(rows[0]?.count).toBe(0);
     } finally {
       await running.close();
     }
@@ -944,38 +1049,65 @@ describe("OAuth provider policy", () => {
     }
   }, 30_000);
 
-  test("rotates refresh tokens and rejects reuse of the consumed token", async () => {
+  test("allows exactly one simultaneous refresh rotation and no loser descendant", async () => {
     const running = await startServer(provider, { approveInteractions: true });
     try {
       const issued = await issueTokens(provider, running.client);
-      const rotatedResponse = await running.client.postForm(
-        "/oauth/token",
-        new URLSearchParams({
-          grant_type: "refresh_token",
-          client_id: issued.clientId,
-          refresh_token: issued.refreshToken,
-          resource: resource.href,
-        }),
+      await pool.query("DROP TRIGGER IF EXISTS delay_refresh_consume");
+      await pool.query(
+        `CREATE TRIGGER delay_refresh_consume
+        BEFORE UPDATE ON oidc_objects
+        FOR EACH ROW
+        SET @consume_delay = IF(
+          OLD.model = 'RefreshToken'
+            AND OLD.consumed_at IS NULL
+            AND NEW.consumed_at IS NOT NULL,
+          SLEEP(0.2),
+          0
+        )`,
       );
-      expect(rotatedResponse.status).toBe(200);
-      const rotated = record(rotatedResponse.json());
+      const refreshRequest = () =>
+        running.client.postForm(
+          "/oauth/token",
+          new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: issued.clientId,
+            refresh_token: issued.refreshToken,
+            resource: resource.href,
+          }),
+        );
+      const responses = await Promise.all([
+        refreshRequest(),
+        refreshRequest(),
+      ]);
+      expect(responses.map((response) => response.status).sort()).toEqual([
+        200,
+        400,
+      ]);
+      const rotated = record(
+        responses.find((response) => response.status === 200)?.json(),
+      );
       expect(rotated.refresh_token).toBeTypeOf("string");
       expect(rotated.refresh_token).not.toBe(issued.refreshToken);
-
-      const reusedResponse = await running.client.postForm(
-        "/oauth/token",
-        new URLSearchParams({
-          grant_type: "refresh_token",
-          client_id: issued.clientId,
-          refresh_token: issued.refreshToken,
-          resource: resource.href,
-        }),
-      );
-      expect(reusedResponse.status).toBe(400);
-      expect(reusedResponse.json()).toMatchObject({
+      expect(
+        responses.find((response) => response.status === 400)?.json(),
+      ).toMatchObject({
         error: "invalid_grant",
       });
+      const [refreshRows] = await pool.query<CountRow[]>(
+        `SELECT COUNT(*) AS count
+        FROM oidc_objects
+        WHERE model = 'RefreshToken'`,
+      );
+      const [accessRows] = await pool.query<CountRow[]>(
+        `SELECT COUNT(*) AS count
+        FROM oidc_objects
+        WHERE model = 'AccessToken'`,
+      );
+      expect(refreshRows[0]?.count).toBe(2);
+      expect(accessRows[0]?.count).toBe(2);
     } finally {
+      await pool.query("DROP TRIGGER IF EXISTS delay_refresh_consume");
       await running.close();
     }
   });

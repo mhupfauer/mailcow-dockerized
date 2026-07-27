@@ -16,7 +16,11 @@ const validEnvironment = {
 
 describe("loadConfig", () => {
   test("parses a valid 64-character hexadecimal encryption key", () => {
-    const config = loadConfig(validEnvironment);
+    const config = loadConfig({
+      ...validEnvironment,
+      MCP_DBPORT: "3307",
+      MCP_REGISTRATIONS_PER_HOUR: "12",
+    });
 
     expect(config.encryptionKey).toEqual(
       Buffer.from(
@@ -27,6 +31,8 @@ describe("loadConfig", () => {
     expect(config.db.password).toBe(
       "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     );
+    expect(config.db.port).toBe(3307);
+    expect(config.registrationsPerHour).toBe(12);
     expect(config.resource.href).toBe("https://mail.example.test/mcp");
     expect(config.resourceMetadataUrl.href).toBe(
       "https://mail.example.test/.well-known/oauth-protected-resource/mcp",

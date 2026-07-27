@@ -1,14 +1,6 @@
-import type Koa from "koa";
-import { expect, test, vi } from "vitest";
+import { expect, test } from "vitest";
 
 import { createIpRateLimiter } from "../../src/http/rate-limit.js";
-
-function fakeContext(ip: string): Koa.Context {
-  return {
-    ip,
-    set: vi.fn(),
-  } as unknown as Koa.Context;
-}
 
 test("bounds IP buckets and admits new clients after stale eviction", async () => {
   let now = 0;
@@ -19,23 +11,14 @@ test("bounds IP buckets and admits new clients after stale eviction", async () =
     sweepIntervalMs: 10,
     now: () => now,
   });
-  const firstNext = vi.fn();
-  const secondNext = vi.fn();
-  const blockedNext = vi.fn();
 
-  await limiter(fakeContext("2001:db8::1"), firstNext);
-  await limiter(fakeContext("2001:db8::2"), secondNext);
-  const blocked = fakeContext("2001:db8::3");
-  await limiter(blocked, blockedNext);
-
-  expect(firstNext).toHaveBeenCalledOnce();
-  expect(secondNext).toHaveBeenCalledOnce();
-  expect(blockedNext).not.toHaveBeenCalled();
-  expect(blocked.status).toBe(429);
+  expect(limiter.consume("2001:db8::1")).toEqual({ allowed: true });
+  expect(limiter.consume("2001:db8::2")).toEqual({ allowed: true });
+  expect(limiter.consume("2001:db8::3")).toEqual({
+    allowed: false,
+    retryAfter: 1,
+  });
 
   now = 101;
-  const admittedNext = vi.fn();
-  await limiter(fakeContext("2001:db8::3"), admittedNext);
-
-  expect(admittedNext).toHaveBeenCalledOnce();
+  expect(limiter.consume("2001:db8::3")).toEqual({ allowed: true });
 });

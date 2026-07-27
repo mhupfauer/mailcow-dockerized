@@ -7,7 +7,6 @@ import Provider, {
 } from "oidc-provider";
 import type { Pool } from "mysql2/promise";
 
-import { createIpRateLimiter } from "../http/rate-limit.js";
 import { MariaDbOidcAdapter } from "./oidc-adapter.js";
 import { loadOrCreateSigningJwk } from "./signing-keys.js";
 
@@ -31,7 +30,6 @@ const allowedRegistrationMetadata = new Set([
 ]);
 const scopeString = MCP_OAUTH_SCOPES.join(" ");
 const registrationPath = "/oauth/reg";
-const registrationWindowMs = 60 * 60 * 1_000;
 
 interface CreateOidcProviderDependencies {
   pool: Pool;
@@ -41,13 +39,11 @@ interface CreateOidcProviderDependencies {
   env?: NodeJS.ProcessEnv;
   allowedRedirectUris?: readonly string[];
   allowLoopbackRedirects?: boolean;
-  registrationsPerHour?: number;
 }
 
 interface OidcProviderPolicy {
   allowedRedirectUris: readonly string[];
   allowLoopbackRedirects: boolean;
-  registrationsPerHour: number;
 }
 
 interface DynamicClientMetadata {
@@ -60,25 +56,6 @@ interface DynamicClientMetadata {
 
 function invalidMetadata(description: string): never {
   throw new Error(description);
-}
-
-function positiveInteger(
-  value: string | undefined,
-  fallback: number,
-  variableName: string,
-): number {
-  if (value === undefined) {
-    return fallback;
-  }
-  if (!/^[1-9][0-9]*$/u.test(value)) {
-    throw new Error(`${variableName} must be a positive integer`);
-  }
-
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`${variableName} must be a positive integer`);
-  }
-  return parsed;
 }
 
 function loadProviderPolicy(env: NodeJS.ProcessEnv): OidcProviderPolicy {
@@ -106,11 +83,6 @@ function loadProviderPolicy(env: NodeJS.ProcessEnv): OidcProviderPolicy {
   return {
     allowedRedirectUris,
     allowLoopbackRedirects: loopbackValue === "1",
-    registrationsPerHour: positiveInteger(
-      env.MCP_REGISTRATIONS_PER_HOUR,
-      10,
-      "MCP_REGISTRATIONS_PER_HOUR",
-    ),
   };
 }
 
@@ -289,8 +261,6 @@ export async function createOidcProvider(
   const allowLoopbackRedirects =
     dependencies.allowLoopbackRedirects ??
     envPolicy.allowLoopbackRedirects;
-  const registrationsPerHour =
-    dependencies.registrationsPerHour ?? envPolicy.registrationsPerHour;
   const allowedRedirectSet = new Set(allowedRedirectUris);
   for (const allowedRedirectUri of allowedRedirectSet) {
     validateRedirectUri(allowedRedirectUri, allowedRedirectSet, false);
@@ -369,11 +339,6 @@ export async function createOidcProvider(
     issuer.href.replace(/\/$/u, ""),
     configuration,
   );
-  const registrationLimiter = createIpRateLimiter({
-    limit: registrationsPerHour,
-    windowMs: registrationWindowMs,
-  });
-
   provider.use(async (context, next) => {
     if (context.method === "GET" && context.path === "/oauth/auth") {
       if (!Object.hasOwn(context.query, "scope")) {
@@ -413,17 +378,6 @@ export async function createOidcProvider(
     ) {
       context.body.scopes_supported = [...MCP_OAUTH_SCOPES];
     }
-  });
-
-  provider.use(async (context, next) => {
-    if (
-      context.method === "POST" &&
-      context.path === registrationPath
-    ) {
-      await registrationLimiter(context, next);
-      return;
-    }
-    await next();
   });
 
   provider.use(async (context, next) => {

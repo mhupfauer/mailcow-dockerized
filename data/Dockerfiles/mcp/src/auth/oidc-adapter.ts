@@ -1,10 +1,15 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type {
-  Adapter,
-  AdapterFactory,
-  AdapterPayload,
+import {
+  errors,
+  type Adapter,
+  type AdapterFactory,
+  type AdapterPayload,
 } from "oidc-provider";
-import type { Pool, RowDataPacket } from "mysql2/promise";
+import type {
+  Pool,
+  ResultSetHeader,
+  RowDataPacket,
+} from "mysql2/promise";
 
 import {
   AesGcmCredentialVault,
@@ -350,14 +355,20 @@ export class MariaDbOidcAdapter implements Adapter {
   }
 
   async consume(id: string): Promise<void> {
-    await this.pool.execute(
+    const [result] = await this.pool.execute<ResultSetHeader>(
       `UPDATE oidc_objects
-      SET consumed_at = COALESCE(consumed_at, UTC_TIMESTAMP(6))
+      SET consumed_at = UTC_TIMESTAMP(6)
       WHERE model = ?
         AND id_hash = ?
+        AND consumed_at IS NULL
         AND expires_at > UTC_TIMESTAMP(6)`,
       [this.model, primaryHash(this.model, id)],
     );
+    if (result.affectedRows !== 1) {
+      throw new errors.InvalidGrant(
+        `${this.model} is already consumed or unavailable`,
+      );
+    }
   }
 
   async destroy(id: string): Promise<void> {

@@ -1,5 +1,3 @@
-import type Koa from "koa";
-
 interface IpRateLimitOptions {
   limit: number;
   windowMs: number;
@@ -13,13 +11,21 @@ interface Window {
   startedAt: number;
 }
 
+export type RateLimitDecision =
+  | { allowed: true }
+  | { allowed: false; retryAfter: number };
+
+export interface IpRateLimiter {
+  consume(ip: string): RateLimitDecision;
+}
+
 export function createIpRateLimiter({
   limit,
   windowMs,
   maxEntries = 10_000,
   sweepIntervalMs = Math.min(windowMs, 60_000),
   now: currentTime = Date.now,
-}: IpRateLimitOptions): Koa.Middleware {
+}: IpRateLimitOptions): IpRateLimiter {
   if (!Number.isSafeInteger(limit) || limit < 1) {
     throw new Error("rate limit must be a positive integer");
   }
@@ -48,47 +54,42 @@ export function createIpRateLimiter({
     nextSweepAt = now + sweepIntervalMs;
   }
 
-  function reject(context: Koa.Context, retryAfter: number): void {
-    context.set("Retry-After", retryAfter.toString());
-    context.status = 429;
-    context.body = {
-      error: "too_many_requests",
-      error_description: "registration rate limit exceeded",
-    };
-  }
-
-  return async (context, next) => {
-    const now = currentTime();
-    sweep(now);
-    const key = context.ip;
-    let window = windows.get(key);
-    if (window !== undefined && now - window.startedAt >= windowMs) {
-      windows.delete(key);
-      window = undefined;
-    }
-
-    if (window === undefined) {
-      if (windows.size >= maxEntries) {
-        sweep(now, true);
+  return {
+    consume(ip) {
+      const now = currentTime();
+      sweep(now);
+      let window = windows.get(ip);
+      if (window !== undefined && now - window.startedAt >= windowMs) {
+        windows.delete(ip);
+        window = undefined;
       }
-      if (windows.size >= maxEntries) {
-        reject(context, Math.ceil(windowMs / 1_000));
-        return;
+
+      if (window === undefined) {
+        if (windows.size >= maxEntries) {
+          sweep(now, true);
+        }
+        if (windows.size >= maxEntries) {
+          return {
+            allowed: false,
+            retryAfter: Math.ceil(windowMs / 1_000),
+          };
+        }
+        window = { count: 0, startedAt: now };
+        windows.set(ip, window);
       }
-      window = { count: 0, startedAt: now };
-      windows.set(key, window);
-    }
 
-    if (window.count >= limit) {
-      const retryAfter = Math.max(
-        1,
-        Math.ceil((window.startedAt + windowMs - now) / 1_000),
-      );
-      reject(context, retryAfter);
-      return;
-    }
+      if (window.count >= limit) {
+        return {
+          allowed: false,
+          retryAfter: Math.max(
+            1,
+            Math.ceil((window.startedAt + windowMs - now) / 1_000),
+          ),
+        };
+      }
 
-    window.count += 1;
-    await next();
+      window.count += 1;
+      return { allowed: true };
+    },
   };
 }
