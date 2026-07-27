@@ -1219,6 +1219,10 @@ test_compose_forwards_mcp_oauth_policy_overrides() {
   chmod 600 "${override_config}"
 
   compose_json="$(
+    unset \
+      MCP_OAUTH_ALLOWED_REDIRECT_URIS \
+      MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS \
+      MCP_REGISTRATIONS_PER_HOUR
     docker compose \
       --env-file "${override_config}" \
       -f "${REPO_DIR}/docker-compose.yml" \
