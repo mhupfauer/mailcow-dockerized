@@ -1,8 +1,4 @@
-import {
-  createHmac,
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import express, {
   type NextFunction,
@@ -11,21 +7,27 @@ import express, {
   type Response,
   type Router,
 } from "express";
-import type { Pool, RowDataPacket } from "mysql2/promise";
+import type { Pool } from "mysql2/promise";
 import type { Provider } from "oidc-provider";
 
 import {
   normalizeMailbox,
   type AccountRepository,
 } from "./account-repository.js";
+import {
+  MariaDbConsentAuthorizationRepository,
+  revokeProviderAuthority,
+  type ConsentAuthorizationState,
+} from "./authorization-state.js";
 import type { CredentialVerifier } from "./credential-verifier.js";
+import { AesGcmCredentialVault } from "./crypto-vault.js";
 import { MCP_OAUTH_SCOPES } from "./oidc-provider.js";
 
 const interactionPath = "/mcp-login/:interaction";
 const csrfCookieName = "mailcow_mcp_interaction_csrf";
 const csrfLifetimeSeconds = 600;
 const maximumFormBytes = 16 * 1_024;
-const maximumRateLimitEntries = 10_000;
+const defaultMaximumConsentSessions = 32;
 const allowedScopeSet = new Set<string>(MCP_OAUTH_SCOPES);
 
 interface InteractionDependencies {
@@ -38,16 +40,22 @@ interface InteractionDependencies {
   encryptionKey: Uint8Array;
   loginAttempts: number;
   loginWindowSeconds: number;
+  maximumInFlightInteractions?: number;
+  maximumLoginQuotaEntries?: number;
+  maximumConsentSessions?: number;
+  verificationTimeoutMs?: number;
   now?: () => number;
-}
-
-interface ConsentRow extends RowDataPacket {
-  scopes: string;
 }
 
 interface Window {
   failures: number;
+  inFlight: number;
   startedAt: number;
+}
+
+interface FailureReservation {
+  release(): void;
+  retainFailure(): void;
 }
 
 class FailureQuota {
@@ -56,12 +64,16 @@ class FailureQuota {
   constructor(
     private readonly limit: number,
     private readonly windowMs: number,
+    private readonly maxEntries: number,
     private readonly now: () => number,
   ) {}
 
   private sweep(currentTime: number): void {
     for (const [key, window] of this.windows) {
-      if (currentTime - window.startedAt >= this.windowMs) {
+      if (
+        window.inFlight === 0 &&
+        currentTime - window.startedAt >= this.windowMs
+      ) {
         this.windows.delete(key);
       }
     }
@@ -72,9 +84,46 @@ class FailureQuota {
     this.sweep(currentTime);
     const existing = this.windows.get(key);
     if (existing !== undefined) {
-      return existing.failures >= this.limit;
+      return existing.failures + existing.inFlight >= this.limit;
     }
-    return this.windows.size >= maximumRateLimitEntries;
+    return this.windows.size >= this.maxEntries;
+  }
+
+  reserve(key: string): FailureReservation | null {
+    const currentTime = this.now();
+    this.sweep(currentTime);
+    let window = this.windows.get(key);
+    if (window === undefined) {
+      if (this.windows.size >= this.maxEntries) {
+        return null;
+      }
+      window = { failures: 0, inFlight: 0, startedAt: currentTime };
+      this.windows.set(key, window);
+    }
+    if (window.failures + window.inFlight >= this.limit) {
+      return null;
+    }
+    window.inFlight += 1;
+    let settled = false;
+    const settle = (failure: boolean) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      window.inFlight -= 1;
+      if (failure) {
+        if (window.failures === 0) {
+          window.startedAt = this.now();
+        }
+        window.failures = Math.min(this.limit, window.failures + 1);
+      } else if (window.failures === 0 && window.inFlight === 0) {
+        this.windows.delete(key);
+      }
+    };
+    return {
+      release: () => settle(false),
+      retainFailure: () => settle(true),
+    };
   }
 
   recordFailure(key: string): void {
@@ -85,8 +134,12 @@ class FailureQuota {
       existing.failures += 1;
       return;
     }
-    if (this.windows.size < maximumRateLimitEntries) {
-      this.windows.set(key, { failures: 1, startedAt: currentTime });
+    if (this.windows.size < this.maxEntries) {
+      this.windows.set(key, {
+        failures: 1,
+        inFlight: 0,
+        startedAt: currentTime,
+      });
     }
   }
 
@@ -98,9 +151,7 @@ class FailureQuota {
     }
     return Math.max(
       1,
-      Math.ceil(
-        (existing.startedAt + this.windowMs - currentTime) / 1_000,
-      ),
+      Math.ceil((existing.startedAt + this.windowMs - currentTime) / 1_000),
     );
   }
 }
@@ -109,9 +160,14 @@ class LoginFailureLimiter {
   private readonly ip: FailureQuota;
   private readonly mailbox: FailureQuota;
 
-  constructor(limit: number, windowMs: number, now: () => number) {
-    this.ip = new FailureQuota(limit, windowMs, now);
-    this.mailbox = new FailureQuota(limit, windowMs, now);
+  constructor(
+    limit: number,
+    windowMs: number,
+    maxEntries: number,
+    now: () => number,
+  ) {
+    this.ip = new FailureQuota(limit, windowMs, maxEntries, now);
+    this.mailbox = new FailureQuota(limit, windowMs, maxEntries, now);
   }
 
   blocked(ip: string, mailbox?: string): boolean {
@@ -128,11 +184,102 @@ class LoginFailureLimiter {
     }
   }
 
+  reserve(ip: string, mailbox: string): FailureReservation | null {
+    const ipReservation = this.ip.reserve(ip);
+    if (ipReservation === null) {
+      return null;
+    }
+    const mailboxReservation = this.mailbox.reserve(mailbox);
+    if (mailboxReservation === null) {
+      ipReservation.release();
+      return null;
+    }
+    let settled = false;
+    return {
+      release() {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        ipReservation.release();
+        mailboxReservation.release();
+      },
+      retainFailure() {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        ipReservation.retainFailure();
+        mailboxReservation.retainFailure();
+      },
+    };
+  }
+
   retryAfter(ip: string, mailbox?: string): number {
     return Math.max(
       this.ip.retryAfter(ip),
       mailbox === undefined ? 1 : this.mailbox.retryAfter(mailbox),
     );
+  }
+}
+
+type LockResult =
+  | { status: "acquired"; release(): void }
+  | { status: "duplicate" }
+  | { status: "full" };
+
+class BoundedInteractionLock {
+  private readonly keys = new Set<string>();
+
+  constructor(private readonly maximum: number) {}
+
+  acquire(key: string): LockResult {
+    if (this.keys.has(key)) {
+      return { status: "duplicate" };
+    }
+    if (this.keys.size >= this.maximum) {
+      return { status: "full" };
+    }
+    this.keys.add(key);
+    let released = false;
+    return {
+      status: "acquired",
+      release: () => {
+        if (!released) {
+          released = true;
+          this.keys.delete(key);
+        }
+      },
+    };
+  }
+}
+
+async function verifyCredential(
+  dependencies: InteractionDependencies,
+  mailbox: string,
+  appPassword: string,
+): Promise<void> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, rejectTimeout) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      rejectTimeout(new Error("credential verification timed out"));
+    }, dependencies.verificationTimeoutMs ?? 15_000);
+  });
+  try {
+    await Promise.race([
+      dependencies.credentialVerifier.verify(
+        mailbox,
+        appPassword,
+        controller.signal,
+      ),
+      timeoutPromise,
+    ]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
   }
 }
 
@@ -165,11 +312,7 @@ function page(title: string, body: string): string {
 </html>`;
 }
 
-function renderLogin(
-  response: Response,
-  csrf: string,
-  error = false,
-): void {
+function renderLogin(response: Response, csrf: string, error = false): void {
   setSecretPageHeaders(response);
   response.status(error ? 401 : 200).send(
     page(
@@ -355,90 +498,10 @@ function requestedScopes(
     return null;
   }
   const scopes = [...new Set(params.scope.split(" ").filter(Boolean))].sort();
-  return (
-    scopes.length > 0 && scopes.every((scope) => allowedScopeSet.has(scope))
-      ? scopes
-      : null
-  );
-}
-
-function validAccountId(accountId: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-    accountId,
-  );
-}
-
-async function loadConsent(
-  pool: Pool,
-  accountId: string,
-  clientId: string,
-): Promise<string[]> {
-  if (!validAccountId(accountId)) {
-    return [];
-  }
-  const [rows] = await pool.execute<ConsentRow[]>(
-    `SELECT CAST(scopes AS CHAR) AS scopes
-     FROM consents
-     WHERE account_id = UNHEX(REPLACE(?, '-', ''))
-       AND client_id = ? AND revoked_at IS NULL`,
-    [accountId, clientId],
-  );
-  try {
-    const value: unknown = JSON.parse(rows[0]?.scopes ?? "[]");
-    return Array.isArray(value) &&
-      value.every(
-        (scope) => typeof scope === "string" && allowedScopeSet.has(scope),
-      )
-      ? [...new Set(value)].sort()
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-async function saveConsent(
-  pool: Pool,
-  accountId: string,
-  clientId: string,
-  scopes: readonly string[],
-): Promise<void> {
-  if (!validAccountId(accountId)) {
-    throw new Error("invalid account");
-  }
-  await pool.execute(
-    `INSERT INTO consents (
-       account_id, client_id, scopes, created_at, revoked_at
-     ) VALUES (
-       UNHEX(REPLACE(?, '-', '')), ?, ?, UTC_TIMESTAMP(6), NULL
-     )
-     ON DUPLICATE KEY UPDATE scopes = VALUES(scopes), revoked_at = NULL`,
-    [accountId, clientId, JSON.stringify([...scopes].sort())],
-  );
-}
-
-async function revokeConsent(
-  dependencies: InteractionDependencies,
-  accountId: string,
-  clientId: string,
-  grantId?: string,
-): Promise<void> {
-  if (validAccountId(accountId)) {
-    await dependencies.pool.execute(
-      `UPDATE consents SET revoked_at = UTC_TIMESTAMP(6)
-       WHERE account_id = UNHEX(REPLACE(?, '-', '')) AND client_id = ?`,
-      [accountId, clientId],
-    );
-  }
-  if (grantId === undefined) {
-    return;
-  }
-  await Promise.all([
-    dependencies.provider.AccessToken.revokeByGrantId(grantId),
-    dependencies.provider.AuthorizationCode.revokeByGrantId(grantId),
-    dependencies.provider.RefreshToken.revokeByGrantId(grantId),
-  ]);
-  const grant = await dependencies.provider.Grant.find(grantId);
-  await grant?.destroy();
+  return scopes.length > 0 &&
+    scopes.every((scope) => allowedScopeSet.has(scope))
+    ? scopes
+    : null;
 }
 
 async function finishConsent(
@@ -448,25 +511,50 @@ async function finishConsent(
   accountId: string,
   clientId: string,
   grantScopes: readonly string[],
-  grantId?: string,
+  existingState: ConsentAuthorizationState | null,
+  currentGrantId: string | undefined,
+  currentSessionId: string,
+  consentRepository: MariaDbConsentAuthorizationRepository,
+  maximumConsentSessions: number,
   consentScopes: readonly string[] = grantScopes,
 ): Promise<void> {
+  const canonicalGrantId =
+    existingState?.reusable === true ? existingState.grantId : undefined;
   let grant =
-    grantId === undefined
+    canonicalGrantId === undefined
       ? undefined
-      : await dependencies.provider.Grant.find(grantId);
+      : await dependencies.provider.Grant.find(canonicalGrantId);
+  if (grant === undefined && currentGrantId !== undefined) {
+    grant = await dependencies.provider.Grant.find(currentGrantId);
+  }
   grant ??= new dependencies.provider.Grant({ accountId, clientId });
-  grant.addResourceScope(
-    dependencies.resource.href,
-    grantScopes.join(" "),
-  );
+  grant.addResourceScope(dependencies.resource.href, grantScopes.join(" "));
   const savedGrantId = await grant.save();
-  await saveConsent(
-    dependencies.pool,
-    accountId,
-    clientId,
-    consentScopes,
+  const sessionIds =
+    existingState?.reusable === true ? [...existingState.sessionIds] : [];
+  if (!sessionIds.includes(currentSessionId)) {
+    if (sessionIds.length >= maximumConsentSessions) {
+      const evictedSessionId = sessionIds.shift();
+      if (evictedSessionId !== undefined) {
+        await revokeProviderAuthority(
+          dependencies.provider,
+          [],
+          [evictedSessionId],
+        );
+      }
+    }
+    sessionIds.push(currentSessionId);
+  }
+  await consentRepository.save(accountId, clientId, {
+    scopes: consentScopes,
+    grantId: savedGrantId,
+    sessionIds,
+  });
+  const obsoleteGrantIds = [canonicalGrantId, currentGrantId].filter(
+    (grantId): grantId is string =>
+      grantId !== undefined && grantId !== savedGrantId,
   );
+  await revokeProviderAuthority(dependencies.provider, obsoleteGrantIds, []);
   await dependencies.provider.interactionFinished(
     request,
     response,
@@ -491,11 +579,26 @@ function reject(
 export function createInteractionRouter(
   dependencies: InteractionDependencies,
 ): Router {
+  const maximumInFlightInteractions =
+    dependencies.maximumInFlightInteractions ?? 1_000;
+  const maximumLoginQuotaEntries =
+    dependencies.maximumLoginQuotaEntries ?? 10_000;
+  const verificationTimeoutMs = dependencies.verificationTimeoutMs ?? 15_000;
+  const maximumConsentSessions =
+    dependencies.maximumConsentSessions ?? defaultMaximumConsentSessions;
   if (
     !Number.isSafeInteger(dependencies.loginAttempts) ||
     dependencies.loginAttempts < 1 ||
     !Number.isSafeInteger(dependencies.loginWindowSeconds) ||
-    dependencies.loginWindowSeconds < 1
+    dependencies.loginWindowSeconds < 1 ||
+    !Number.isSafeInteger(maximumInFlightInteractions) ||
+    maximumInFlightInteractions < 1 ||
+    !Number.isSafeInteger(maximumLoginQuotaEntries) ||
+    maximumLoginQuotaEntries < 1 ||
+    !Number.isSafeInteger(verificationTimeoutMs) ||
+    verificationTimeoutMs < 1 ||
+    !Number.isSafeInteger(maximumConsentSessions) ||
+    maximumConsentSessions < 1
   ) {
     throw new Error("invalid login rate limit");
   }
@@ -505,9 +608,16 @@ export function createInteractionRouter(
   const limiter = new LoginFailureLimiter(
     dependencies.loginAttempts,
     dependencies.loginWindowSeconds * 1_000,
+    maximumLoginQuotaEntries,
     now,
   );
-  const inFlight = new Set<string>();
+  const interactionLock = new BoundedInteractionLock(
+    maximumInFlightInteractions,
+  );
+  const consentRepository = new MariaDbConsentAuthorizationRepository(
+    dependencies.pool,
+    new AesGcmCredentialVault(dependencies.encryptionKey),
+  );
 
   const precheckIp: RequestHandler = (request, response, next) => {
     const ip = requestIp(request);
@@ -560,12 +670,7 @@ export function createInteractionRouter(
         reject(response, 400, "Invalid interaction.");
         return;
       }
-      const csrf = csrfState(
-        response,
-        details.uid,
-        key,
-        now,
-      );
+      const csrf = csrfState(response, details.uid, key, now);
       if (details.prompt.name === "login") {
         renderLogin(response, csrf);
         return;
@@ -576,23 +681,26 @@ export function createInteractionRouter(
       }
       const params = details.params as Record<string, unknown>;
       const accountId = details.session?.accountId;
+      const sessionId = details.session?.uid;
       const clientId = params.client_id;
       const scopes = requestedScopes(params, dependencies.resource);
       if (
         accountId === undefined ||
+        typeof sessionId !== "string" ||
+        sessionId === "" ||
         typeof clientId !== "string" ||
         scopes === null
       ) {
         reject(response, 400, "Invalid interaction.");
         return;
       }
-      const existingScopes = await loadConsent(
-        dependencies.pool,
+      const existingState = await consentRepository.getActive(
         accountId,
         clientId,
       );
       if (
-        scopes.every((scope) => existingScopes.includes(scope))
+        existingState?.reusable === true &&
+        scopes.every((scope) => existingState.scopes.includes(scope))
       ) {
         await finishConsent(
           request,
@@ -601,8 +709,12 @@ export function createInteractionRouter(
           accountId,
           clientId,
           scopes,
+          existingState,
           details.grantId,
-          existingScopes,
+          sessionId,
+          consentRepository,
+          maximumConsentSessions,
+          existingState.scopes,
         );
         return;
       }
@@ -630,21 +742,19 @@ export function createInteractionRouter(
         reject(response, 403, "Invalid request.");
         return;
       }
-      if (!validCsrf(
-        request,
-        interaction,
-        body.csrf,
-        key,
-        now,
-      )) {
+      if (!validCsrf(request, interaction, body.csrf, key, now)) {
         reject(response, 403, "Invalid request.");
         return;
       }
-      if (inFlight.has(interaction)) {
+      const lock = interactionLock.acquire(interaction);
+      if (lock.status === "duplicate") {
         reject(response, 409, "Interaction is already being processed.");
         return;
       }
-      inFlight.add(interaction);
+      if (lock.status === "full") {
+        reject(response, 503, "Authentication service is busy.");
+        return;
+      }
       try {
         const details = await dependencies.provider.interactionDetails(
           request,
@@ -679,7 +789,8 @@ export function createInteractionRouter(
           }
           const ip = requestIp(request);
           const mailboxKey = mailbox.toLowerCase();
-          if (limiter.blocked(ip, mailboxKey)) {
+          const reservation = limiter.reserve(ip, mailboxKey);
+          if (reservation === null) {
             reject(
               response,
               429,
@@ -689,15 +800,19 @@ export function createInteractionRouter(
             return;
           }
           try {
-            await dependencies.credentialVerifier.verify(
+            await verifyCredential(dependencies, mailbox, appPassword);
+          } catch {
+            reservation.retainFailure();
+            renderLogin(response, body.csrf as string, true);
+            return;
+          }
+          reservation.release();
+          let accountId: string;
+          try {
+            accountId = await dependencies.accountRepository.upsertVerified(
               mailbox,
               appPassword,
             );
-            const accountId =
-              await dependencies.accountRepository.upsertVerified(
-                mailbox,
-                appPassword,
-              );
             await dependencies.provider.interactionFinished(
               request,
               response,
@@ -705,8 +820,7 @@ export function createInteractionRouter(
               { mergeWithLastSubmission: false },
             );
           } catch {
-            limiter.record(ip, mailboxKey);
-            renderLogin(response, body.csrf as string, true);
+            reject(response, 503, "Authentication service is unavailable.");
           }
           return;
         }
@@ -716,10 +830,13 @@ export function createInteractionRouter(
         }
         const params = details.params as Record<string, unknown>;
         const accountId = details.session?.accountId;
+        const sessionId = details.session?.uid;
         const clientId = params.client_id;
         const scopes = requestedScopes(params, dependencies.resource);
         if (
           accountId === undefined ||
+          typeof sessionId !== "string" ||
+          sessionId === "" ||
           typeof clientId !== "string" ||
           scopes === null
         ) {
@@ -727,11 +844,20 @@ export function createInteractionRouter(
           return;
         }
         if (body.decision === "revoke") {
-          await revokeConsent(
-            dependencies,
+          const existingState = await consentRepository.getStored(
             accountId,
             clientId,
-            details.grantId,
+          );
+          await consentRepository.revoke(accountId, clientId);
+          await revokeProviderAuthority(
+            dependencies.provider,
+            [
+              ...(existingState?.grantId === undefined
+                ? []
+                : [existingState.grantId]),
+              ...(details.grantId === undefined ? [] : [details.grantId]),
+            ],
+            [],
           );
           await dependencies.provider.interactionFinished(
             request,
@@ -742,17 +868,23 @@ export function createInteractionRouter(
             },
             { mergeWithLastSubmission: false },
           );
+          await revokeProviderAuthority(
+            dependencies.provider,
+            [],
+            [...(existingState?.sessionIds ?? []), sessionId],
+          );
           return;
         }
         if (body.decision !== "approve") {
           reject(response, 400, "Invalid interaction.");
           return;
         }
-        const existingScopes = await loadConsent(
-          dependencies.pool,
+        const existingState = await consentRepository.getActive(
           accountId,
           clientId,
         );
+        const existingScopes =
+          existingState?.reusable === true ? existingState.scopes : [];
         const persistedScopes = [
           ...new Set([...existingScopes, ...scopes]),
         ].sort();
@@ -763,7 +895,11 @@ export function createInteractionRouter(
           accountId,
           clientId,
           scopes,
+          existingState,
           details.grantId,
+          sessionId,
+          consentRepository,
+          maximumConsentSessions,
           persistedScopes,
         );
       } catch {
@@ -771,7 +907,7 @@ export function createInteractionRouter(
           reject(response, 400, "Invalid interaction.");
         }
       } finally {
-        inFlight.delete(interaction);
+        lock.release();
       }
     },
     formError,

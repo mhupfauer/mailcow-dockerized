@@ -18,6 +18,10 @@ import {
 
 import { createApp } from "../../src/app.js";
 import { MariaDbAccountRepository } from "../../src/auth/account-repository.js";
+import {
+  MariaDbAccountAuthorizationRevoker,
+  MariaDbConsentAuthorizationRepository,
+} from "../../src/auth/authorization-state.js";
 import type { CredentialVerifier } from "../../src/auth/credential-verifier.js";
 import { AesGcmCredentialVault } from "../../src/auth/crypto-vault.js";
 import { createOidcProvider } from "../../src/auth/oidc-provider.js";
@@ -51,6 +55,18 @@ interface HttpResponse {
 interface ConsentRow extends RowDataPacket {
   scopes: string;
   revoked: number;
+}
+
+interface CountRow extends RowDataPacket {
+  count: number;
+}
+
+function storedConsentScopes(raw: string | undefined): string[] {
+  const parsed: unknown = JSON.parse(raw ?? "[]");
+  if (Array.isArray(parsed)) {
+    return parsed as string[];
+  }
+  return (parsed as { scopes?: string[] }).scopes ?? [];
 }
 
 class HttpClient {
@@ -129,7 +145,10 @@ class HttpClient {
     });
   }
 
-  get(path: string, headers: Record<string, string> = {}): Promise<HttpResponse> {
+  get(
+    path: string,
+    headers: Record<string, string> = {},
+  ): Promise<HttpResponse> {
     return this.request(path, { headers });
   }
 
@@ -195,6 +214,10 @@ describe("mailcow app-password interactions", () => {
   let server: ReturnType<ReturnType<typeof createApp>["listen"]>;
   let protocolAttempts: Array<{ mailbox: string; password: string }>;
   let authenticationFailure: boolean;
+  let verificationDelayMs: number;
+  let verificationStarted: (() => void) | undefined;
+  let accountRepository: MariaDbAccountRepository;
+  let credentialVerifier: CredentialVerifier;
 
   beforeAll(async () => {
     container = await new GenericContainer("mariadb:10.11")
@@ -228,22 +251,46 @@ describe("mailcow app-password interactions", () => {
     await pool.query("DELETE FROM service_state");
     protocolAttempts = [];
     authenticationFailure = false;
-    const credentialVerifier: CredentialVerifier = {
+    verificationDelayMs = 0;
+    verificationStarted = undefined;
+    credentialVerifier = {
       async verify(mailbox, password) {
         protocolAttempts.push({ mailbox, password });
+        verificationStarted?.();
+        if (verificationDelayMs > 0) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, verificationDelayMs),
+          );
+        }
         if (authenticationFailure) {
           throw new Error(`protocol rejected ${mailbox} ${password}`);
         }
       },
     };
     const vault = new AesGcmCredentialVault(encryptionKey);
-    const accountRepository = new MariaDbAccountRepository(pool, vault);
+    accountRepository = new MariaDbAccountRepository(pool, vault);
     provider = await createOidcProvider({
       pool,
       issuer,
       resource,
       encryptionKey,
     });
+    await startApp();
+  });
+
+  async function startApp(
+    overrides: {
+      maximumInFlightInteractions?: number;
+      maximumLoginQuotaEntries?: number;
+      maximumConsentSessions?: number;
+      verificationTimeoutMs?: number;
+    } = {},
+  ): Promise<void> {
+    if (server?.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
     const app = createApp({
       readiness: async () => true,
       resourceMetadataUrl: new URL(
@@ -260,12 +307,13 @@ describe("mailcow app-password interactions", () => {
         encryptionKey,
         loginAttempts: 5,
         loginWindowSeconds: 900,
+        ...overrides,
       },
     });
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once("listening", resolve));
     client = new HttpClient((server.address() as AddressInfo).port);
-  });
+  }
 
   afterEach(async () => {
     await new Promise<void>((resolve, reject) => {
@@ -303,6 +351,19 @@ describe("mailcow app-password interactions", () => {
     return { path, response };
   }
 
+  async function loginPageFor(
+    targetClient: HttpClient,
+    clientId: string,
+    scope = "mail.read",
+  ): Promise<{ path: string; response: HttpResponse }> {
+    const start = await targetClient.get(authPath(clientId, scope));
+    const path = locationPath(start);
+    expect(path).toMatch(/^\/mcp-login\/[A-Za-z0-9_-]+$/u);
+    const response = await targetClient.get(path);
+    expect(response.status).toBe(200);
+    return { path, response };
+  }
+
   async function submitLogin(
     path: string,
     page: HttpResponse,
@@ -330,6 +391,22 @@ describe("mailcow app-password interactions", () => {
     const response = await client.get(path);
     expect(response.status).toBe(200);
     return { path, response };
+  }
+
+  async function distinctLoginPages(
+    clientId: string,
+    count: number,
+  ): Promise<
+    Array<{ client: HttpClient; path: string; response: HttpResponse }>
+  > {
+    const port = (server.address() as AddressInfo).port;
+    return Promise.all(
+      Array.from({ length: count }, async () => {
+        const distinctClient = new HttpClient(port);
+        const login = await loginPageFor(distinctClient, clientId);
+        return { client: distinctClient, ...login };
+      }),
+    );
   }
 
   test("renders a secret-free login and completes both-protocol authentication", async () => {
@@ -459,6 +536,254 @@ describe("mailcow app-password interactions", () => {
     expect(protocolAttempts).toHaveLength(5);
   });
 
+  test("atomically caps concurrent protocol verification by source IP across distinct interactions", async () => {
+    const clientId = await registerClient();
+    const logins = await distinctLoginPages(clientId, 6);
+    verificationDelayMs = 200;
+
+    const firstFive = logins
+      .slice(0, 5)
+      .map(({ client: loginClient, path, response }, index) =>
+        loginClient.postForm(
+          path,
+          {
+            csrf: hidden(response.body, "csrf"),
+            mailbox: `user${index}@example.test`,
+            app_password: "app-password",
+          },
+          {
+            "x-forwarded-for": "198.51.100.10, 203.0.113.80",
+          },
+        ),
+      );
+    await new Promise<void>((resolve) => {
+      if (protocolAttempts.length === 5) {
+        resolve();
+        return;
+      }
+      verificationStarted = () => {
+        if (protocolAttempts.length === 5) {
+          resolve();
+        }
+      };
+    });
+    const sixth = logins[5]!;
+    const rejected = await sixth.client.postForm(
+      sixth.path,
+      {
+        csrf: hidden(sixth.response.body, "csrf"),
+        mailbox: "user5@example.test",
+        app_password: "app-password",
+      },
+      {
+        "x-forwarded-for": "198.51.100.10, 203.0.113.80",
+      },
+    );
+
+    expect(rejected.status).toBe(429);
+    expect(protocolAttempts).toHaveLength(5);
+    expect(
+      (await Promise.all(firstFive)).map((response) => response.status),
+    ).toEqual([303, 303, 303, 303, 303]);
+  });
+
+  test("atomically caps concurrent protocol verification by mailbox across distinct IPs", async () => {
+    const clientId = await registerClient();
+    const logins = await distinctLoginPages(clientId, 6);
+    verificationDelayMs = 200;
+
+    const firstFive = logins
+      .slice(0, 5)
+      .map(({ client: loginClient, path, response }, index) =>
+        loginClient.postForm(
+          path,
+          {
+            csrf: hidden(response.body, "csrf"),
+            mailbox:
+              index % 2 === 0 ? "USER@EXAMPLE.TEST" : "user@example.test",
+            app_password: "app-password",
+          },
+          {
+            "x-forwarded-for": `198.51.100.10, 203.0.113.${90 + index}`,
+          },
+        ),
+      );
+    await new Promise<void>((resolve) => {
+      if (protocolAttempts.length === 5) {
+        resolve();
+        return;
+      }
+      verificationStarted = () => {
+        if (protocolAttempts.length === 5) {
+          resolve();
+        }
+      };
+    });
+    const sixth = logins[5]!;
+    const rejected = await sixth.client.postForm(
+      sixth.path,
+      {
+        csrf: hidden(sixth.response.body, "csrf"),
+        mailbox: "User@example.test",
+        app_password: "app-password",
+      },
+      {
+        "x-forwarded-for": "198.51.100.10, 203.0.113.99",
+      },
+    );
+
+    expect(rejected.status).toBe(429);
+    expect(protocolAttempts).toHaveLength(5);
+    expect(
+      (await Promise.all(firstFive)).map((response) => response.status),
+    ).toEqual([303, 303, 303, 303, 303]);
+  });
+
+  test("fails closed when the bounded interaction lock is full", async () => {
+    await startApp({ maximumInFlightInteractions: 1 });
+    const clientId = await registerClient();
+    const logins = await distinctLoginPages(clientId, 2);
+    verificationDelayMs = 200;
+    const started = new Promise<void>((resolve) => {
+      verificationStarted = resolve;
+    });
+    const first = logins[0]!.client.postForm(logins[0]!.path, {
+      csrf: hidden(logins[0]!.response.body, "csrf"),
+      mailbox: "first@example.test",
+      app_password: "app-password",
+    });
+    await started;
+    const rejected = await logins[1]!.client.postForm(logins[1]!.path, {
+      csrf: hidden(logins[1]!.response.body, "csrf"),
+      mailbox: "second@example.test",
+      app_password: "app-password",
+    });
+
+    expect(rejected.status).toBe(503);
+    expect(protocolAttempts).toHaveLength(1);
+    expect((await first).status).toBe(303);
+  });
+
+  test("times out protocol verification and releases the interaction lock", async () => {
+    await startApp({ verificationTimeoutMs: 25 });
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    verificationDelayMs = 100;
+
+    const timedOut = await submitLogin(login.path, login.response);
+    expect(timedOut.status).toBe(401);
+
+    verificationDelayMs = 0;
+    const retried = await submitLogin(login.path, login.response);
+    expect(retried.status).toBe(303);
+    expect(protocolAttempts).toHaveLength(2);
+  });
+
+  test("does not poison authentication quotas after repository failures", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const originalUpsert =
+      accountRepository.upsertVerified.bind(accountRepository);
+    let failures = 0;
+    const upsert = vi
+      .spyOn(accountRepository, "upsertVerified")
+      .mockImplementation(async (mailbox, password) => {
+        if (failures < 5) {
+          failures += 1;
+          throw new Error(`database rejected ${mailbox} ${password}`);
+        }
+        return originalUpsert(mailbox, password);
+      });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const response = await submitLogin(
+        login.path,
+        login.response,
+        "user@example.test",
+        "operational-secret",
+      );
+      expect(response.status).toBe(503);
+      expect(response.headers["cache-control"]).toContain("no-store");
+      expect(response.body).not.toContain("database rejected");
+      expect(response.body).not.toContain("operational-secret");
+    }
+    const succeeded = await submitLogin(
+      login.path,
+      login.response,
+      "user@example.test",
+      "app-password",
+    );
+
+    expect(succeeded.status).toBe(303);
+    expect(protocolAttempts).toHaveLength(6);
+    upsert.mockRestore();
+  });
+
+  test("does not poison authentication quotas after provider failures", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const originalFinished = provider.interactionFinished.bind(provider);
+    let failures = 0;
+    const finished = vi
+      .spyOn(provider, "interactionFinished")
+      .mockImplementation(async (...args) => {
+        if (failures < 5) {
+          failures += 1;
+          throw new Error("provider unavailable");
+        }
+        return originalFinished(...args);
+      });
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const response = await submitLogin(
+        login.path,
+        login.response,
+        "user@example.test",
+        "operational-secret",
+      );
+      expect(response.status).toBe(503);
+      expect(response.headers["cache-control"]).toContain("no-store");
+      expect(response.body).not.toContain("provider unavailable");
+      expect(response.body).not.toContain("operational-secret");
+    }
+    const succeeded = await submitLogin(
+      login.path,
+      login.response,
+      "user@example.test",
+      "app-password",
+    );
+
+    expect(succeeded.status).toBe(303);
+    expect(protocolAttempts).toHaveLength(6);
+    finished.mockRestore();
+  });
+
+  test("fails closed when the bounded login quota map is full", async () => {
+    await startApp({ maximumLoginQuotaEntries: 1 });
+    authenticationFailure = true;
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+
+    const failed = await submitLogin(
+      login.path,
+      login.response,
+      "first@example.test",
+      "bad-password",
+      { "x-forwarded-for": "198.51.100.1" },
+    );
+    expect(failed.status).toBe(401);
+
+    const rejected = await submitLogin(
+      login.path,
+      login.response,
+      "second@example.test",
+      "bad-password",
+      { "x-forwarded-for": "198.51.100.2" },
+    );
+    expect(rejected.status).toBe(429);
+    expect(protocolAttempts).toHaveLength(1);
+  });
+
   test("counts oversized login bodies against the source quota before authentication", async () => {
     const clientId = await registerClient();
     const login = await loginPage(clientId);
@@ -535,14 +860,12 @@ describe("mailcow app-password interactions", () => {
       `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
        FROM consents`,
     );
-    expect(JSON.parse(consents[0]?.scopes ?? "[]")).toEqual(["mail.read"]);
+    expect(storedConsentScopes(consents[0]?.scopes)).toEqual(["mail.read"]);
     expect(consents[0]?.revoked).toBe(0);
 
     const callback = await client.get(locationPath(approved));
     const callbackUrl = new URL(callback.headers.location as string);
-    expect(callbackUrl.origin).toBe(
-      new URL(redirectUri).origin,
-    );
+    expect(callbackUrl.origin).toBe(new URL(redirectUri).origin);
     const authorizationCode = await provider.AuthorizationCode.find(
       callbackUrl.searchParams.get("code") as string,
     );
@@ -550,6 +873,18 @@ describe("mailcow app-password interactions", () => {
     expect(grantId).toBeTypeOf("string");
     const grant = await provider.Grant.find(grantId as string);
     expect(grant?.getResourceScope(resource.href)).toBe("mail.read");
+    const token = await client.postForm("/oauth/token", {
+      grant_type: "authorization_code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code: callbackUrl.searchParams.get("code") as string,
+      code_verifier: verifierValue,
+      resource: resource.href,
+    });
+    expect(token.status).toBe(200);
+    const tokenBody = token.json() as Record<string, unknown>;
+    expect(tokenBody.access_token).toBeTypeOf("string");
+    expect(tokenBody.refresh_token).toBeTypeOf("string");
 
     const reused = await client.get(authPath(clientId, "mail.read"));
     expect(new URL(reused.headers.location as string).origin).toBe(
@@ -574,14 +909,12 @@ describe("mailcow app-password interactions", () => {
       `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
        FROM consents`,
     );
-    expect(JSON.parse(expandedRows[0]?.scopes ?? "[]")).toEqual([
+    expect(storedConsentScopes(expandedRows[0]?.scopes)).toEqual([
       "mail.read",
       "mail.send",
     ]);
 
-    const freshSession = new HttpClient(
-      (server.address() as AddressInfo).port,
-    );
+    const freshSession = new HttpClient((server.address() as AddressInfo).port);
     const freshStart = await freshSession.get(authPath(clientId, "mail.read"));
     const freshLoginPath = locationPath(freshStart);
     const freshLogin = await freshSession.get(freshLoginPath);
@@ -594,14 +927,45 @@ describe("mailcow app-password interactions", () => {
     const freshConsentPath = locationPath(freshResume);
     const narrowerReuse = await freshSession.get(freshConsentPath);
     expect(narrowerReuse.status).toBe(303);
+    const freshCallback = await freshSession.get(locationPath(narrowerReuse));
+    const freshCallbackUrl = new URL(freshCallback.headers.location as string);
+    const freshCode = freshCallbackUrl.searchParams.get("code");
+    expect(freshCode).toBeTypeOf("string");
+    const freshAuthorizationCode = await provider.AuthorizationCode.find(
+      freshCode as string,
+    );
+    expect(freshAuthorizationCode?.grantId).toBe(grantId);
+    const [grantRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Grant'`,
+    );
+    expect(grantRows[0]?.count).toBe(1);
     const [preservedRows] = await pool.query<ConsentRow[]>(
       `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
        FROM consents`,
     );
-    expect(JSON.parse(preservedRows[0]?.scopes ?? "[]")).toEqual([
+    expect(storedConsentScopes(preservedRows[0]?.scopes)).toEqual([
       "mail.read",
       "mail.send",
     ]);
+    const rawConsent = preservedRows[0]?.scopes ?? "";
+    expect(rawConsent).not.toContain(grantId as string);
+    const parsedConsent = JSON.parse(rawConsent) as Record<string, unknown>;
+    expect(parsedConsent.authorityEnvelope).toBeTypeOf("string");
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    );
+    const accountId = authorizationCode?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    const authorizationState = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(authorizationState?.reusable).toBe(true);
+    expect(authorizationState?.sessionIds.length).toBeGreaterThan(0);
+    for (const sessionId of authorizationState?.sessionIds ?? []) {
+      expect(rawConsent).not.toContain(sessionId);
+    }
 
     const revocationStart = await client.get(
       authPath(clientId, "mail.read mail.send mail.organize"),
@@ -615,6 +979,19 @@ describe("mailcow app-password interactions", () => {
     });
     expect(revoked.status).toBe(303);
     expect(await provider.Grant.find(grantId as string)).toBeUndefined();
+    expect(
+      await provider.AuthorizationCode.find(freshCode as string),
+    ).toBeUndefined();
+    expect(
+      await provider.AccessToken.find(tokenBody.access_token as string),
+    ).toBeUndefined();
+    expect(
+      await provider.RefreshToken.find(tokenBody.refresh_token as string),
+    ).toBeUndefined();
+    const [remainingGrants] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Grant'`,
+    );
+    expect(remainingGrants[0]?.count).toBe(0);
     const [revokedRows] = await pool.query<ConsentRow[]>(
       `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
        FROM consents`,
@@ -625,6 +1002,226 @@ describe("mailcow app-password interactions", () => {
     const afterRevocation = await client.get(authPath(clientId, "mail.read"));
     const afterRevocationPath = locationPath(afterRevocation);
     expect(afterRevocationPath).toMatch(/^\/mcp-login\//u);
+  });
+
+  test("treats legacy consent arrays as incomplete authority and re-prompts", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId, "mail.read");
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(approved.status).toBe(303);
+    await client.get(locationPath(approved));
+    await pool.execute(`UPDATE consents SET scopes = JSON_ARRAY('mail.read')`);
+
+    const freshSession = new HttpClient((server.address() as AddressInfo).port);
+    const freshStart = await freshSession.get(authPath(clientId, "mail.read"));
+    const freshLoginPath = locationPath(freshStart);
+    const freshLogin = await freshSession.get(freshLoginPath);
+    const freshLoggedIn = await freshSession.postForm(freshLoginPath, {
+      csrf: hidden(freshLogin.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const freshResume = await freshSession.get(locationPath(freshLoggedIn));
+    const freshConsentPath = locationPath(freshResume);
+    const freshConsent = await freshSession.get(freshConsentPath);
+
+    expect(freshConsent.status).toBe(200);
+    expect(freshConsent.body).toContain("Authorize mailbox access");
+  });
+
+  test("treats tampered encrypted consent authority as incomplete and re-prompts", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId, "mail.read");
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(approved.status).toBe(303);
+    await client.get(locationPath(approved));
+    await pool.execute(
+      `UPDATE consents
+       SET scopes = JSON_SET(scopes, '$.authorityEnvelope', 'tampered')`,
+    );
+
+    const freshSession = new HttpClient((server.address() as AddressInfo).port);
+    const freshStart = await freshSession.get(authPath(clientId, "mail.read"));
+    const freshLoginPath = locationPath(freshStart);
+    const freshLogin = await freshSession.get(freshLoginPath);
+    const freshLoggedIn = await freshSession.postForm(freshLoginPath, {
+      csrf: hidden(freshLogin.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const freshResume = await freshSession.get(locationPath(freshLoggedIn));
+    const freshConsentPath = locationPath(freshResume);
+    const freshConsent = await freshSession.get(freshConsentPath);
+
+    expect(freshConsent.status).toBe(200);
+    expect(freshConsent.body).toContain("Authorize mailbox access");
+    expect(freshConsent.body).not.toContain("tampered");
+  });
+
+  test("bounds remembered consent sessions and destroys the evicted provider session", async () => {
+    await startApp({ maximumConsentSessions: 2 });
+    const clientId = await registerClient();
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    );
+    const login = await loginPage(clientId, "mail.read");
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const firstCode = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const firstAuthorizationCode = await provider.AuthorizationCode.find(
+      firstCode as string,
+    );
+    const accountId = firstAuthorizationCode?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    const firstState = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    const firstSessionId = firstState?.sessionIds[0];
+    expect(firstSessionId).toBeTypeOf("string");
+
+    for (let index = 0; index < 2; index += 1) {
+      const freshSession = new HttpClient(
+        (server.address() as AddressInfo).port,
+      );
+      const freshLogin = await loginPageFor(
+        freshSession,
+        clientId,
+        "mail.read",
+      );
+      const freshLoggedIn = await freshSession.postForm(freshLogin.path, {
+        csrf: hidden(freshLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      });
+      const freshResume = await freshSession.get(locationPath(freshLoggedIn));
+      const freshConsentPath = locationPath(freshResume);
+      const reused = await freshSession.get(freshConsentPath);
+      expect(reused.status).toBe(303);
+      await freshSession.get(locationPath(reused));
+    }
+
+    const boundedState = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(boundedState?.sessionIds).toHaveLength(2);
+    expect(boundedState?.sessionIds).not.toContain(firstSessionId);
+    expect(
+      await provider.Session.findByUid(firstSessionId as string),
+    ).toBeUndefined();
+    for (const sessionId of boundedState?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeDefined();
+    }
+  });
+
+  test("revokes account credentials, consent, grants, tokens, codes, and sessions together", async () => {
+    const clientId = await registerClient();
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    );
+    const login = await loginPage(clientId, "mail.read");
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const callbackUrl = new URL(callback.headers.location as string);
+    const code = callbackUrl.searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    const grantId = authorizationCode?.grantId;
+    expect(accountId).toBeTypeOf("string");
+    expect(grantId).toBeTypeOf("string");
+    const token = await client.postForm("/oauth/token", {
+      grant_type: "authorization_code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code: code as string,
+      code_verifier: verifierValue,
+      resource: resource.href,
+    });
+    expect(token.status).toBe(200);
+    const tokenBody = token.json() as Record<string, unknown>;
+
+    const freshSession = new HttpClient((server.address() as AddressInfo).port);
+    const freshLogin = await loginPageFor(freshSession, clientId, "mail.read");
+    const freshLoggedIn = await freshSession.postForm(freshLogin.path, {
+      csrf: hidden(freshLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const freshResume = await freshSession.get(locationPath(freshLoggedIn));
+    const freshConsentPath = locationPath(freshResume);
+    const reused = await freshSession.get(freshConsentPath);
+    const freshCallback = await freshSession.get(locationPath(reused));
+    const freshCode = new URL(
+      freshCallback.headers.location as string,
+    ).searchParams.get("code");
+    const state = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(state?.sessionIds).toHaveLength(2);
+
+    const revoker = new MariaDbAccountAuthorizationRevoker(
+      accountRepository,
+      consentRepository,
+      provider,
+    );
+    const revokeAccessToken = vi
+      .spyOn(provider.AccessToken, "revokeByGrantId")
+      .mockRejectedValueOnce(new Error("provider unavailable"));
+    await expect(
+      revoker.revokeCredential(accountId as string),
+    ).rejects.toThrow();
+    revokeAccessToken.mockRestore();
+    await revoker.revokeCredential(accountId as string);
+
+    expect(
+      await accountRepository.getCredential(accountId as string),
+    ).toBeNull();
+    expect(
+      await consentRepository.getActive(accountId as string, clientId),
+    ).toBeNull();
+    expect(await provider.Grant.find(grantId as string)).toBeUndefined();
+    expect(
+      await provider.AuthorizationCode.find(freshCode as string),
+    ).toBeUndefined();
+    expect(
+      await provider.AccessToken.find(tokenBody.access_token as string),
+    ).toBeUndefined();
+    expect(
+      await provider.RefreshToken.find(tokenBody.refresh_token as string),
+    ).toBeUndefined();
+    for (const sessionId of state?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeUndefined();
+    }
+    const afterRevocation = await client.get(authPath(clientId, "mail.read"));
+    expect(locationPath(afterRevocation)).toMatch(/^\/mcp-login\//u);
   });
 
   test("rejects a provider interaction with an unallowlisted return URL", async () => {
@@ -664,8 +1261,9 @@ describe("mailcow app-password interactions", () => {
 
     // Delay the repository path without changing the external protocol fake.
     const execute = pool.execute.bind(pool);
-    const executeSpy = vi.spyOn(pool, "execute").mockImplementation(
-      async (...args: Parameters<typeof pool.execute>) => {
+    const executeSpy = vi
+      .spyOn(pool, "execute")
+      .mockImplementation(async (...args: Parameters<typeof pool.execute>) => {
         if (
           typeof args[0] === "string" &&
           args[0].includes("INSERT INTO accounts")
@@ -673,8 +1271,7 @@ describe("mailcow app-password interactions", () => {
           await waiting;
         }
         return execute(...args);
-      },
-    );
+      });
     const first = submitLogin(login.path, login.response);
     await startedVerification;
     const duplicate = await submitLogin(login.path, login.response);
@@ -684,9 +1281,9 @@ describe("mailcow app-password interactions", () => {
       duplicate,
     ]);
 
-    expect(
-      [firstResponse.status, duplicateResponse.status].sort(),
-    ).toEqual([303, 409]);
+    expect([firstResponse.status, duplicateResponse.status].sort()).toEqual([
+      303, 409,
+    ]);
     executeSpy.mockRestore();
   });
 });

@@ -3,7 +3,11 @@ import nodemailer from "nodemailer";
 import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
 
 export interface CredentialVerifier {
-  verify(mailbox: string, appPassword: string): Promise<void>;
+  verify(
+    mailbox: string,
+    appPassword: string,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 export interface ProtocolCredentialOptions {
@@ -16,7 +20,10 @@ export interface ProtocolCredentialOptions {
 }
 
 export interface CredentialAuthenticator {
-  authenticate(options: ProtocolCredentialOptions): Promise<void>;
+  authenticate(
+    options: ProtocolCredentialOptions,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 interface ImapClient {
@@ -46,7 +53,8 @@ export function createImapAuthenticator(
   createClient: ImapClientFactory = (options) => new ImapFlow(options),
 ): CredentialAuthenticator {
   return {
-    async authenticate(options) {
+    async authenticate(options, signal) {
+      signal?.throwIfAborted();
       const client = createClient({
         host: options.host,
         port: 143,
@@ -66,11 +74,20 @@ export function createImapAuthenticator(
         logger: false,
         verifyOnly: true,
       });
+      let closed = false;
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          client.close();
+        }
+      };
+      signal?.addEventListener("abort", close, { once: true });
 
       try {
         await client.connect();
       } finally {
-        client.close();
+        signal?.removeEventListener("abort", close);
+        close();
       }
     },
   };
@@ -82,7 +99,8 @@ export function createSmtpAuthenticator(
     nodemailer.createTransport(options),
 ): CredentialAuthenticator {
   return {
-    async authenticate(options) {
+    async authenticate(options, signal) {
+      signal?.throwIfAborted();
       const transport = createTransport({
         host: options.host,
         port: 587,
@@ -99,11 +117,20 @@ export function createSmtpAuthenticator(
           ca: trustSource,
         },
       });
+      let closed = false;
+      const close = () => {
+        if (!closed) {
+          closed = true;
+          transport.close();
+        }
+      };
+      signal?.addEventListener("abort", close, { once: true });
 
       try {
         await transport.verify();
       } finally {
-        transport.close();
+        signal?.removeEventListener("abort", close);
+        close();
       }
     },
   };
@@ -122,7 +149,11 @@ export class DualProtocolCredentialVerifier implements CredentialVerifier {
       options.smtpAuthenticator ?? createSmtpAuthenticator(options.ca);
   }
 
-  async verify(mailbox: string, appPassword: string): Promise<void> {
+  async verify(
+    mailbox: string,
+    appPassword: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     try {
       await this.imapAuthenticator.authenticate({
         username: mailbox,
@@ -131,7 +162,7 @@ export class DualProtocolCredentialVerifier implements CredentialVerifier {
         servername: this.options.hostname,
         rejectUnauthorized: true,
         ca: this.options.ca,
-      });
+      }, signal);
       await this.smtpAuthenticator.authenticate({
         username: mailbox,
         password: appPassword,
@@ -139,7 +170,7 @@ export class DualProtocolCredentialVerifier implements CredentialVerifier {
         servername: this.options.hostname,
         rejectUnauthorized: true,
         ca: this.options.ca,
-      });
+      }, signal);
     } catch {
       throw new Error("mailbox authentication failed");
     }

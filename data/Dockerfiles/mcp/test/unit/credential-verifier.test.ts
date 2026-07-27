@@ -155,6 +155,37 @@ describe("default protocol authenticators", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  test("aborts and closes an in-progress IMAP connection", async () => {
+    const controller = new AbortController();
+    let rejectConnection: ((error: Error) => void) | undefined;
+    const close = vi.fn(() => {
+      rejectConnection?.(new Error("connection aborted"));
+    });
+    const authenticator = createImapAuthenticator(ca, () => ({
+      connect: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectConnection = reject;
+        }),
+      close,
+    }));
+
+    const authenticating = authenticator.authenticate(
+      {
+        username: mailbox,
+        password: appPassword,
+        host: "dovecot-mailcow",
+        servername: "mail.example.test",
+        rejectUnauthorized: true,
+        ca,
+      },
+      controller.signal,
+    );
+    controller.abort();
+
+    await expect(authenticating).rejects.toThrow("connection aborted");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   test("uses SMTP submission STARTTLS PLAIN and closes after verification", async () => {
     const verify = vi.fn(async () => true);
     const close = vi.fn();
@@ -209,6 +240,37 @@ describe("default protocol authenticators", () => {
         ca,
       }),
     ).rejects.toThrow("verification failed");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  test("aborts and closes an in-progress SMTP verification", async () => {
+    const controller = new AbortController();
+    let rejectVerification: ((error: Error) => void) | undefined;
+    const close = vi.fn(() => {
+      rejectVerification?.(new Error("verification aborted"));
+    });
+    const authenticator = createSmtpAuthenticator(ca, () => ({
+      verify: () =>
+        new Promise<true>((_resolve, reject) => {
+          rejectVerification = reject;
+        }),
+      close,
+    }));
+
+    const authenticating = authenticator.authenticate(
+      {
+        username: mailbox,
+        password: appPassword,
+        host: "postfix-mailcow",
+        servername: "mail.example.test",
+        rejectUnauthorized: true,
+        ca,
+      },
+      controller.signal,
+    );
+    controller.abort();
+
+    await expect(authenticating).rejects.toThrow("verification aborted");
     expect(close).toHaveBeenCalledOnce();
   });
 });
