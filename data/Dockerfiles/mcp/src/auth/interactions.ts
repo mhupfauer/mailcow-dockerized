@@ -15,8 +15,10 @@ import {
   type AccountRepository,
 } from "./account-repository.js";
 import {
+  InactiveAuthorizationAccountError,
   MariaDbConsentAuthorizationRepository,
   revokeProviderAuthority,
+  revokeProviderAuthorityBestEffort,
   type ConsentAuthorizationState,
 } from "./authorization-state.js";
 import type { CredentialVerifier } from "./credential-verifier.js";
@@ -28,6 +30,7 @@ const csrfCookieName = "mailcow_mcp_interaction_csrf";
 const csrfLifetimeSeconds = 600;
 const maximumFormBytes = 16 * 1_024;
 const defaultMaximumConsentSessions = 32;
+const defaultMaximumAuthorityMutations = 1_000;
 const allowedScopeSet = new Set<string>(MCP_OAUTH_SCOPES);
 
 interface InteractionDependencies {
@@ -43,6 +46,7 @@ interface InteractionDependencies {
   maximumInFlightInteractions?: number;
   maximumLoginQuotaEntries?: number;
   maximumConsentSessions?: number;
+  maximumAuthorityMutations?: number;
   verificationTimeoutMs?: number;
   now?: () => number;
 }
@@ -249,6 +253,45 @@ class BoundedInteractionLock {
           released = true;
           this.keys.delete(key);
         }
+      },
+    };
+  }
+}
+
+interface KeyedLockLease {
+  release(): void;
+}
+
+class BoundedKeyedLock {
+  private readonly tails = new Map<string, Promise<void>>();
+  private pending = 0;
+
+  constructor(private readonly maximum: number) {}
+
+  async acquire(key: string): Promise<KeyedLockLease | null> {
+    if (this.pending >= this.maximum) {
+      return null;
+    }
+    this.pending += 1;
+    const predecessor = this.tails.get(key) ?? Promise.resolve();
+    let releaseNext!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseNext = resolve;
+    });
+    this.tails.set(key, current);
+    await predecessor;
+    let released = false;
+    return {
+      release: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.pending -= 1;
+        if (this.tails.get(key) === current) {
+          this.tails.delete(key);
+        }
+        releaseNext();
       },
     };
   }
@@ -545,11 +588,27 @@ async function finishConsent(
     }
     sessionIds.push(currentSessionId);
   }
-  await consentRepository.save(accountId, clientId, {
-    scopes: consentScopes,
-    grantId: savedGrantId,
-    sessionIds,
-  });
+  try {
+    await consentRepository.save(accountId, clientId, {
+      scopes: consentScopes,
+      grantId: savedGrantId,
+      sessionIds,
+    });
+  } catch (error) {
+    if (error instanceof InactiveAuthorizationAccountError) {
+      await consentRepository.revoke(accountId, clientId);
+    }
+    await revokeProviderAuthorityBestEffort(
+      dependencies.provider,
+      [
+        savedGrantId,
+        ...(canonicalGrantId === undefined ? [] : [canonicalGrantId]),
+        ...(currentGrantId === undefined ? [] : [currentGrantId]),
+      ],
+      [...sessionIds, currentSessionId],
+    );
+    throw error;
+  }
   const obsoleteGrantIds = [canonicalGrantId, currentGrantId].filter(
     (grantId): grantId is string =>
       grantId !== undefined && grantId !== savedGrantId,
@@ -561,6 +620,71 @@ async function finishConsent(
     { consent: { grantId: savedGrantId } },
     { mergeWithLastSubmission: false },
   );
+}
+
+function unsafeStoredAuthority(
+  state: ConsentAuthorizationState | null,
+): boolean {
+  return (
+    state !== null &&
+    !(state.active && state.reusable) &&
+    !state.replacementAllowed
+  );
+}
+
+async function quarantineUnsafeAuthority(
+  dependencies: InteractionDependencies,
+  consentRepository: MariaDbConsentAuthorizationRepository,
+  accountId: string,
+  clientId: string,
+  currentGrantId: string | undefined,
+  currentSessionId: string,
+): Promise<void> {
+  await dependencies.accountRepository.markCredentialRejected(accountId);
+  await consentRepository.revoke(accountId, clientId);
+  await revokeProviderAuthorityBestEffort(
+    dependencies.provider,
+    currentGrantId === undefined ? [] : [currentGrantId],
+    [currentSessionId],
+  );
+}
+
+async function finishRevocation(
+  request: Request,
+  response: Response,
+  dependencies: InteractionDependencies,
+  consentRepository: MariaDbConsentAuthorizationRepository,
+  accountId: string,
+  clientId: string,
+  state: ConsentAuthorizationState | null,
+  currentGrantId: string | undefined,
+  currentSessionId: string,
+): Promise<void> {
+  await revokeProviderAuthority(
+    dependencies.provider,
+    [
+      ...(state?.grantId === undefined ? [] : [state.grantId]),
+      ...(currentGrantId === undefined ? [] : [currentGrantId]),
+    ],
+    (state?.sessionIds ?? []).filter(
+      (sessionId) => sessionId !== currentSessionId,
+    ),
+  );
+  const returnTo = await dependencies.provider.interactionResult(
+    request,
+    response,
+    {
+      error: "access_denied",
+      error_description: "Mailbox access was revoked",
+    },
+    { mergeWithLastSubmission: false },
+  );
+  await consentRepository.revoke(accountId, clientId);
+  await revokeProviderAuthority(dependencies.provider, [], [currentSessionId]);
+  response.statusCode = 303;
+  response.setHeader("Location", returnTo);
+  response.setHeader("Content-Length", "0");
+  response.end();
 }
 
 function reject(
@@ -586,6 +710,8 @@ export function createInteractionRouter(
   const verificationTimeoutMs = dependencies.verificationTimeoutMs ?? 15_000;
   const maximumConsentSessions =
     dependencies.maximumConsentSessions ?? defaultMaximumConsentSessions;
+  const maximumAuthorityMutations =
+    dependencies.maximumAuthorityMutations ?? defaultMaximumAuthorityMutations;
   if (
     !Number.isSafeInteger(dependencies.loginAttempts) ||
     dependencies.loginAttempts < 1 ||
@@ -598,7 +724,9 @@ export function createInteractionRouter(
     !Number.isSafeInteger(verificationTimeoutMs) ||
     verificationTimeoutMs < 1 ||
     !Number.isSafeInteger(maximumConsentSessions) ||
-    maximumConsentSessions < 1
+    maximumConsentSessions < 1 ||
+    !Number.isSafeInteger(maximumAuthorityMutations) ||
+    maximumAuthorityMutations < 1
   ) {
     throw new Error("invalid login rate limit");
   }
@@ -614,10 +742,13 @@ export function createInteractionRouter(
   const interactionLock = new BoundedInteractionLock(
     maximumInFlightInteractions,
   );
+  const authorityLock = new BoundedKeyedLock(maximumAuthorityMutations);
   const consentRepository = new MariaDbConsentAuthorizationRepository(
     dependencies.pool,
     new AesGcmCredentialVault(dependencies.encryptionKey),
   );
+  const authorityKey = (accountId: string, clientId: string) =>
+    `${accountId}\u0000${clientId}\u0000${dependencies.resource.href}`;
 
   const precheckIp: RequestHandler = (request, response, next) => {
     const ip = requestIp(request);
@@ -694,31 +825,68 @@ export function createInteractionRouter(
         reject(response, 400, "Invalid interaction.");
         return;
       }
-      const existingState = await consentRepository.getActive(
-        accountId,
-        clientId,
+      const authorityLease = await authorityLock.acquire(
+        authorityKey(accountId, clientId),
       );
-      if (
-        existingState?.reusable === true &&
-        scopes.every((scope) => existingState.scopes.includes(scope))
-      ) {
-        await finishConsent(
-          request,
-          response,
-          dependencies,
-          accountId,
-          clientId,
-          scopes,
-          existingState,
-          details.grantId,
-          sessionId,
-          consentRepository,
-          maximumConsentSessions,
-          existingState.scopes,
-        );
+      if (authorityLease === null) {
+        reject(response, 503, "Authorization service is busy.");
         return;
       }
-      renderConsent(response, csrf, scopes);
+      try {
+        const storedState = await consentRepository.getStored(
+          accountId,
+          clientId,
+        );
+        if (unsafeStoredAuthority(storedState)) {
+          await quarantineUnsafeAuthority(
+            dependencies,
+            consentRepository,
+            accountId,
+            clientId,
+            details.grantId,
+            sessionId,
+          );
+          reject(response, 401, "Reconnect mailbox access.");
+          return;
+        }
+        const existingState =
+          storedState?.active === true && storedState.reusable
+            ? storedState
+            : null;
+        if (
+          existingState !== null &&
+          scopes.every((scope) => existingState.scopes.includes(scope))
+        ) {
+          await finishConsent(
+            request,
+            response,
+            dependencies,
+            accountId,
+            clientId,
+            scopes,
+            existingState,
+            details.grantId,
+            sessionId,
+            consentRepository,
+            maximumConsentSessions,
+            existingState.scopes,
+          );
+          return;
+        }
+        renderConsent(response, csrf, scopes);
+      } catch (error) {
+        if (!response.headersSent) {
+          reject(
+            response,
+            error instanceof InactiveAuthorizationAccountError ? 401 : 503,
+            error instanceof InactiveAuthorizationAccountError
+              ? "Reconnect mailbox access."
+              : "Authorization service is unavailable.",
+          );
+        }
+      } finally {
+        authorityLease.release();
+      }
     } catch {
       if (!response.headersSent) {
         reject(response, 400, "Invalid interaction.");
@@ -843,65 +1011,83 @@ export function createInteractionRouter(
           reject(response, 400, "Invalid interaction.");
           return;
         }
-        if (body.decision === "revoke") {
-          const existingState = await consentRepository.getStored(
+        const authorityLease = await authorityLock.acquire(
+          authorityKey(accountId, clientId),
+        );
+        if (authorityLease === null) {
+          reject(response, 503, "Authorization service is busy.");
+          return;
+        }
+        try {
+          const storedState = await consentRepository.getStored(
             accountId,
             clientId,
           );
-          await consentRepository.revoke(accountId, clientId);
-          await revokeProviderAuthority(
-            dependencies.provider,
-            [
-              ...(existingState?.grantId === undefined
-                ? []
-                : [existingState.grantId]),
-              ...(details.grantId === undefined ? [] : [details.grantId]),
-            ],
-            [],
-          );
-          await dependencies.provider.interactionFinished(
+          if (unsafeStoredAuthority(storedState)) {
+            await quarantineUnsafeAuthority(
+              dependencies,
+              consentRepository,
+              accountId,
+              clientId,
+              details.grantId,
+              sessionId,
+            );
+            reject(response, 401, "Reconnect mailbox access.");
+            return;
+          }
+          if (body.decision === "revoke") {
+            await finishRevocation(
+              request,
+              response,
+              dependencies,
+              consentRepository,
+              accountId,
+              clientId,
+              storedState,
+              details.grantId,
+              sessionId,
+            );
+            return;
+          }
+          if (body.decision !== "approve") {
+            reject(response, 400, "Invalid interaction.");
+            return;
+          }
+          const existingState =
+            storedState?.active === true && storedState.reusable
+              ? storedState
+              : null;
+          const existingScopes = existingState?.scopes ?? [];
+          const persistedScopes = [
+            ...new Set([...existingScopes, ...scopes]),
+          ].sort();
+          await finishConsent(
             request,
             response,
-            {
-              error: "access_denied",
-              error_description: "Mailbox access was revoked",
-            },
-            { mergeWithLastSubmission: false },
+            dependencies,
+            accountId,
+            clientId,
+            scopes,
+            existingState,
+            details.grantId,
+            sessionId,
+            consentRepository,
+            maximumConsentSessions,
+            persistedScopes,
           );
-          await revokeProviderAuthority(
-            dependencies.provider,
-            [],
-            [...(existingState?.sessionIds ?? []), sessionId],
-          );
-          return;
+        } catch (error) {
+          if (!response.headersSent) {
+            reject(
+              response,
+              error instanceof InactiveAuthorizationAccountError ? 401 : 503,
+              error instanceof InactiveAuthorizationAccountError
+                ? "Reconnect mailbox access."
+                : "Authorization service is unavailable.",
+            );
+          }
+        } finally {
+          authorityLease.release();
         }
-        if (body.decision !== "approve") {
-          reject(response, 400, "Invalid interaction.");
-          return;
-        }
-        const existingState = await consentRepository.getActive(
-          accountId,
-          clientId,
-        );
-        const existingScopes =
-          existingState?.reusable === true ? existingState.scopes : [];
-        const persistedScopes = [
-          ...new Set([...existingScopes, ...scopes]),
-        ].sort();
-        await finishConsent(
-          request,
-          response,
-          dependencies,
-          accountId,
-          clientId,
-          scopes,
-          existingState,
-          details.grantId,
-          sessionId,
-          consentRepository,
-          maximumConsentSessions,
-          persistedScopes,
-        );
       } catch {
         if (!response.headersSent) {
           reject(response, 400, "Invalid interaction.");

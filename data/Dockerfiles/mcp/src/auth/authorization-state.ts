@@ -14,6 +14,8 @@ const uuidPattern =
 interface ConsentRow extends RowDataPacket {
   clientId: string;
   value: string;
+  active: number;
+  replacementAllowed: number;
 }
 
 interface StoredConsentV1 {
@@ -34,6 +36,18 @@ export interface ConsentAuthorizationState {
   grantId?: string;
   sessionIds: string[];
   reusable: boolean;
+  active: boolean;
+  replacementAllowed: boolean;
+}
+
+export class InactiveAuthorizationAccountError extends Error {
+  constructor() {
+    super("authorization account is inactive");
+  }
+}
+
+export interface AccountAuthorizationGate {
+  isAccountActive(accountId: string): Promise<boolean>;
 }
 
 function validAccountId(accountId: string): boolean {
@@ -137,6 +151,8 @@ export class MariaDbConsentAuthorizationRepository {
         scopes: stored.scopes,
         sessionIds: [],
         reusable: false,
+        active: row.active === 1,
+        replacementAllowed: row.replacementAllowed === 1,
       };
     }
     try {
@@ -154,12 +170,16 @@ export class MariaDbConsentAuthorizationRepository {
         grantId: authority.grantId,
         sessionIds: [...new Set(authority.sessionIds)],
         reusable: true,
+        active: row.active === 1,
+        replacementAllowed: row.replacementAllowed === 1,
       };
     } catch {
       return {
         scopes: stored.scopes,
         sessionIds: [],
         reusable: false,
+        active: row.active === 1,
+        replacementAllowed: row.replacementAllowed === 1,
       };
     }
   }
@@ -172,7 +192,8 @@ export class MariaDbConsentAuthorizationRepository {
       return null;
     }
     const [rows] = await this.pool.execute<ConsentRow[]>(
-      `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value
+      `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
+              1 AS active, 0 AS replacementAllowed
        FROM consents c
        INNER JOIN accounts a ON a.id = c.account_id
        WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))
@@ -192,10 +213,17 @@ export class MariaDbConsentAuthorizationRepository {
       return null;
     }
     const [rows] = await this.pool.execute<ConsentRow[]>(
-      `SELECT client_id AS clientId, CAST(scopes AS CHAR) AS value
-       FROM consents
-       WHERE account_id = UNHEX(REPLACE(?, '-', ''))
-         AND client_id = ?`,
+      `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
+              (c.revoked_at IS NULL AND a.revoked_at IS NULL) AS active,
+              (
+                c.revoked_at IS NOT NULL
+                AND a.revoked_at IS NULL
+                AND a.updated_at > c.revoked_at
+              ) AS replacementAllowed
+       FROM consents c
+       INNER JOIN accounts a ON a.id = c.account_id
+       WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))
+         AND c.client_id = ?`,
       [accountId, clientId],
     );
     return rows[0] === undefined ? null : this.parseRow(accountId, rows[0]);
@@ -237,15 +265,35 @@ export class MariaDbConsentAuthorizationRepository {
       scopes,
       authorityEnvelope,
     };
-    await this.pool.execute(
-      `INSERT INTO consents (
-         account_id, client_id, scopes, created_at, revoked_at
-       ) VALUES (
-         UNHEX(REPLACE(?, '-', '')), ?, ?, UTC_TIMESTAMP(6), NULL
-       )
-       ON DUPLICATE KEY UPDATE scopes = VALUES(scopes), revoked_at = NULL`,
-      [accountId, clientId, JSON.stringify(stored)],
-    );
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [accounts] = await connection.execute<RowDataPacket[]>(
+        `SELECT id
+         FROM accounts
+         WHERE id = UNHEX(REPLACE(?, '-', '')) AND revoked_at IS NULL
+         FOR UPDATE`,
+        [accountId],
+      );
+      if (accounts[0] === undefined) {
+        throw new InactiveAuthorizationAccountError();
+      }
+      await connection.execute(
+        `INSERT INTO consents (
+           account_id, client_id, scopes, created_at, revoked_at
+         ) VALUES (
+           UNHEX(REPLACE(?, '-', '')), ?, ?, UTC_TIMESTAMP(6), NULL
+         )
+         ON DUPLICATE KEY UPDATE scopes = VALUES(scopes), revoked_at = NULL`,
+        [accountId, clientId, JSON.stringify(stored)],
+      );
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   async revoke(accountId: string, clientId: string): Promise<void> {
@@ -264,9 +312,16 @@ export class MariaDbConsentAuthorizationRepository {
       return [];
     }
     const [rows] = await this.pool.execute<ConsentRow[]>(
-      `SELECT client_id AS clientId, CAST(scopes AS CHAR) AS value
-       FROM consents
-       WHERE account_id = UNHEX(REPLACE(?, '-', ''))`,
+      `SELECT c.client_id AS clientId, CAST(c.scopes AS CHAR) AS value,
+              (c.revoked_at IS NULL AND a.revoked_at IS NULL) AS active,
+              (
+                c.revoked_at IS NOT NULL
+                AND a.revoked_at IS NULL
+                AND a.updated_at > c.revoked_at
+              ) AS replacementAllowed
+       FROM consents c
+       INNER JOIN accounts a ON a.id = c.account_id
+       WHERE c.account_id = UNHEX(REPLACE(?, '-', ''))`,
       [accountId],
     );
     const states = await Promise.all(
@@ -309,6 +364,54 @@ export async function revokeProviderAuthority(
   }
 }
 
+export async function revokeProviderAuthorityBestEffort(
+  provider: Provider,
+  grantIds: readonly string[],
+  sessionIds: readonly string[],
+): Promise<void> {
+  const operations: Promise<unknown>[] = [];
+  for (const grantId of new Set(grantIds.filter(Boolean))) {
+    operations.push(
+      provider.AccessToken.revokeByGrantId(grantId),
+      provider.AuthorizationCode.revokeByGrantId(grantId),
+      provider.RefreshToken.revokeByGrantId(grantId),
+      (async () => {
+        const grant = await provider.Grant.find(grantId);
+        await grant?.destroy();
+      })(),
+    );
+  }
+  for (const sessionId of new Set(sessionIds.filter(Boolean))) {
+    operations.push(
+      (async () => {
+        const session = await provider.Session.findByUid(sessionId);
+        await session?.destroy();
+      })(),
+    );
+  }
+  const results = await Promise.allSettled(operations);
+  if (results.some((result) => result.status === "rejected")) {
+    throw new Error("unable to revoke provider authority");
+  }
+}
+
+export class MariaDbAccountAuthorizationGate implements AccountAuthorizationGate {
+  constructor(private readonly pool: Pool) {}
+
+  async isAccountActive(accountId: string): Promise<boolean> {
+    if (!validAccountId(accountId)) {
+      return false;
+    }
+    const [rows] = await this.pool.execute<RowDataPacket[]>(
+      `SELECT 1
+       FROM accounts
+       WHERE id = UNHEX(REPLACE(?, '-', '')) AND revoked_at IS NULL`,
+      [accountId],
+    );
+    return rows[0] !== undefined;
+  }
+}
+
 export class MariaDbAccountAuthorizationRevoker {
   constructor(
     private readonly accountRepository: AccountRepository,
@@ -317,15 +420,15 @@ export class MariaDbAccountAuthorizationRevoker {
   ) {}
 
   async revokeCredential(accountId: string): Promise<void> {
-    const states = await this.consentRepository.listStored(accountId);
     await this.accountRepository.markCredentialRejected(accountId);
-    await this.consentRepository.revokeAll(accountId);
-    await revokeProviderAuthority(
+    const states = await this.consentRepository.listStored(accountId);
+    await revokeProviderAuthorityBestEffort(
       this.provider,
       states.flatMap((state) =>
         state.grantId === undefined ? [] : [state.grantId],
       ),
       states.flatMap((state) => state.sessionIds),
     );
+    await this.consentRepository.revokeAll(accountId);
   }
 }

@@ -19,6 +19,7 @@ import {
 import { createApp } from "../../src/app.js";
 import { MariaDbAccountRepository } from "../../src/auth/account-repository.js";
 import {
+  MariaDbAccountAuthorizationGate,
   MariaDbAccountAuthorizationRevoker,
   MariaDbConsentAuthorizationRepository,
 } from "../../src/auth/authorization-state.js";
@@ -283,6 +284,7 @@ describe("mailcow app-password interactions", () => {
       maximumInFlightInteractions?: number;
       maximumLoginQuotaEntries?: number;
       maximumConsentSessions?: number;
+      maximumAuthorityMutations?: number;
       verificationTimeoutMs?: number;
     } = {},
   ): Promise<void> {
@@ -389,6 +391,18 @@ describe("mailcow app-password interactions", () => {
     const path = locationPath(resume);
     expect(path).toMatch(/^\/mcp-login\/[A-Za-z0-9_-]+$/u);
     const response = await client.get(path);
+    expect(response.status).toBe(200);
+    return { path, response };
+  }
+
+  async function reachConsentFor(
+    targetClient: HttpClient,
+    loginResponse: HttpResponse,
+  ): Promise<{ path: string; response: HttpResponse }> {
+    const resume = await targetClient.get(locationPath(loginResponse));
+    const path = locationPath(resume);
+    expect(path).toMatch(/^\/mcp-login\/[A-Za-z0-9_-]+$/u);
+    const response = await targetClient.get(path);
     expect(response.status).toBe(200);
     return { path, response };
   }
@@ -973,11 +987,42 @@ describe("mailcow app-password interactions", () => {
     const revocationPath = locationPath(revocationStart);
     const revocation = await client.get(revocationPath);
     expect(revocation.body).toContain("mail.organize");
-    const revoked = await client.postForm(revocationPath, {
+    const revokeForm = {
       csrf: hidden(revocation.body, "csrf"),
       decision: "revoke",
-    });
+    };
+    const revokeAccessToken = vi
+      .spyOn(provider.AccessToken, "revokeByGrantId")
+      .mockRejectedValueOnce(new Error("provider unavailable"));
+    const originalInteractionResult = provider.interactionResult.bind(provider);
+    let stagedReturnTo: string | undefined;
+    const interactionResult = vi
+      .spyOn(provider, "interactionResult")
+      .mockImplementation(async (...args) => {
+        stagedReturnTo = await originalInteractionResult(...args);
+        return stagedReturnTo;
+      });
+    const unavailable = await client.postForm(revocationPath, revokeForm);
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers["cache-control"]).toContain("no-store");
+    expect(unavailable.body).not.toContain("provider unavailable");
+    expect(await provider.Grant.find(grantId as string)).toBeDefined();
+    const [retryRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(retryRows[0]?.revoked).toBe(0);
+    expect(retryRows[0]?.scopes).toBe(rawConsent);
+    for (const sessionId of authorizationState?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeDefined();
+    }
+    revokeAccessToken.mockRestore();
+
+    const revoked = await client.postForm(revocationPath, revokeForm);
     expect(revoked.status).toBe(303);
+    expect(revoked.headers["content-length"]).toBe("0");
+    expect(revoked.headers.location).toBe(stagedReturnTo);
+    interactionResult.mockRestore();
     expect(await provider.Grant.find(grantId as string)).toBeUndefined();
     expect(
       await provider.AuthorizationCode.find(freshCode as string),
@@ -997,6 +1042,9 @@ describe("mailcow app-password interactions", () => {
        FROM consents`,
     );
     expect(revokedRows[0]?.revoked).toBe(1);
+    for (const sessionId of authorizationState?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeUndefined();
+    }
 
     await client.get(locationPath(revoked));
     const afterRevocation = await client.get(authPath(clientId, "mail.read"));
@@ -1004,7 +1052,272 @@ describe("mailcow app-password interactions", () => {
     expect(afterRevocationPath).toMatch(/^\/mcp-login\//u);
   });
 
-  test("treats legacy consent arrays as incomplete authority and re-prompts", async () => {
+  test("serializes parallel first approvals onto one canonical grant", async () => {
+    const clientId = await registerClient();
+    const port = (server.address() as AddressInfo).port;
+    const firstClient = new HttpClient(port);
+    const secondClient = new HttpClient(port);
+    const firstLogin = await loginPageFor(firstClient, clientId);
+    const secondLogin = await loginPageFor(secondClient, clientId);
+    const firstLoggedIn = await firstClient.postForm(firstLogin.path, {
+      csrf: hidden(firstLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const secondLoggedIn = await secondClient.postForm(secondLogin.path, {
+      csrf: hidden(secondLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const firstConsent = await reachConsentFor(firstClient, firstLoggedIn);
+    const secondConsent = await reachConsentFor(secondClient, secondLoggedIn);
+    const originalSave = provider.Grant.prototype.save;
+    const save = vi
+      .spyOn(provider.Grant.prototype, "save")
+      .mockImplementation(async function (...args) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return originalSave.apply(this, args);
+      });
+
+    const [firstApproved, secondApproved] = await Promise.all([
+      firstClient.postForm(firstConsent.path, {
+        csrf: hidden(firstConsent.response.body, "csrf"),
+        decision: "approve",
+      }),
+      secondClient.postForm(secondConsent.path, {
+        csrf: hidden(secondConsent.response.body, "csrf"),
+        decision: "approve",
+      }),
+    ]);
+    save.mockRestore();
+
+    expect(firstApproved.status).toBe(303);
+    expect(secondApproved.status).toBe(303);
+    const [grantRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Grant'`,
+    );
+    expect(grantRows[0]?.count).toBe(1);
+    const [sessionRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Session'`,
+    );
+    expect(sessionRows[0]?.count).toBe(2);
+    const firstCallback = await firstClient.get(locationPath(firstApproved));
+    const firstCode = new URL(
+      firstCallback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      firstCode as string,
+    );
+    const state = await new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    ).getActive(authorizationCode?.accountId as string, clientId);
+    expect(state?.sessionIds).toHaveLength(2);
+    const [rawRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    const raw = rawRows[0]?.scopes ?? "";
+    expect(raw).not.toContain(authorizationCode?.grantId as string);
+    for (const sessionId of state?.sessionIds ?? []) {
+      expect(raw).not.toContain(sessionId);
+    }
+  });
+
+  test("fails closed when the bounded authority mutation lock is full", async () => {
+    await startApp({ maximumAuthorityMutations: 1 });
+    const firstClientId = await registerClient();
+    const secondClientId = await registerClient();
+    const port = (server.address() as AddressInfo).port;
+    const firstClient = new HttpClient(port);
+    const secondClient = new HttpClient(port);
+    const firstLogin = await loginPageFor(firstClient, firstClientId);
+    const secondLogin = await loginPageFor(secondClient, secondClientId);
+    const firstLoggedIn = await firstClient.postForm(firstLogin.path, {
+      csrf: hidden(firstLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const secondLoggedIn = await secondClient.postForm(secondLogin.path, {
+      csrf: hidden(secondLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const firstConsent = await reachConsentFor(firstClient, firstLoggedIn);
+    const secondConsent = await reachConsentFor(secondClient, secondLoggedIn);
+    const originalSave = provider.Grant.prototype.save;
+    let releaseSave!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    let grantSaved!: () => void;
+    const saved = new Promise<void>((resolve) => {
+      grantSaved = resolve;
+    });
+    const save = vi
+      .spyOn(provider.Grant.prototype, "save")
+      .mockImplementation(async function (...args) {
+        const grantId = await originalSave.apply(this, args);
+        grantSaved();
+        await waiting;
+        return grantId;
+      });
+    const firstApproval = firstClient.postForm(firstConsent.path, {
+      csrf: hidden(firstConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    await saved;
+    const rejected = await secondClient.postForm(secondConsent.path, {
+      csrf: hidden(secondConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    releaseSave();
+    const approved = await firstApproval;
+    save.mockRestore();
+
+    expect(rejected.status).toBe(503);
+    expect(rejected.headers["cache-control"]).toContain("no-store");
+    expect(approved.status).toBe(303);
+  });
+
+  test("serializes concurrent session-cap updates without forgetting a live session", async () => {
+    await startApp({ maximumConsentSessions: 2 });
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(callback.headers.location as string).searchParams.get(
+      "code",
+    );
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId as string;
+
+    const port = (server.address() as AddressInfo).port;
+    const freshClients = [new HttpClient(port), new HttpClient(port)];
+    const consentPages = await Promise.all(
+      freshClients.map(async (freshClient) => {
+        const freshLogin = await loginPageFor(freshClient, clientId);
+        const freshLoggedIn = await freshClient.postForm(freshLogin.path, {
+          csrf: hidden(freshLogin.response.body, "csrf"),
+          mailbox: "user@example.test",
+          app_password: "app-password",
+        });
+        const resume = await freshClient.get(locationPath(freshLoggedIn));
+        const path = locationPath(resume);
+        const response = await freshClient.get(path);
+        return { freshClient, response };
+      }),
+    );
+    expect(consentPages.map(({ response }) => response.status)).toEqual([
+      303, 303,
+    ]);
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+    );
+    const state = await consentRepository.getActive(accountId, clientId);
+    expect(state?.sessionIds).toHaveLength(2);
+    const [sessionRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Session'`,
+    );
+    expect(sessionRows[0]?.count).toBe(2);
+    for (const sessionId of state?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeDefined();
+    }
+  });
+
+  test("refuses consent when the account is revoked between read and transactional save", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const originalSave = provider.Grant.prototype.save;
+    let releaseSave!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    let grantSaved!: () => void;
+    const saved = new Promise<void>((resolve) => {
+      grantSaved = resolve;
+    });
+    const save = vi
+      .spyOn(provider.Grant.prototype, "save")
+      .mockImplementation(async function (...args) {
+        const grantId = await originalSave.apply(this, args);
+        grantSaved();
+        await waiting;
+        return grantId;
+      });
+    const approval = client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    await saved;
+    const [accountRows] = await pool.query<
+      Array<RowDataPacket & { accountId: string }>
+    >(
+      `SELECT LOWER(CONCAT(
+         SUBSTR(HEX(id), 1, 8), '-',
+         SUBSTR(HEX(id), 9, 4), '-',
+         SUBSTR(HEX(id), 13, 4), '-',
+         SUBSTR(HEX(id), 17, 4), '-',
+         SUBSTR(HEX(id), 21)
+       )) AS accountId
+       FROM accounts`,
+    );
+    const accountId = accountRows[0]?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    await accountRepository.markCredentialRejected(accountId as string);
+    releaseSave();
+    const rejected = await approval;
+    save.mockRestore();
+
+    expect(rejected.status).toBe(401);
+    expect(rejected.headers["cache-control"]).toContain("no-store");
+    const [grantRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Grant'`,
+    );
+    expect(grantRows[0]?.count).toBe(0);
+    const [sessionRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Session'`,
+    );
+    expect(sessionRows[0]?.count).toBe(0);
+    expect(
+      await new MariaDbAccountAuthorizationGate(pool).isAccountActive(
+        accountId as string,
+      ),
+    ).toBe(false);
+    const oldSession = await client.get(authPath(clientId, "mail.read"));
+    expect(locationPath(oldSession)).toMatch(/^\/mcp-login\//u);
+
+    const reauthenticated = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const reauthLogin = await loginPageFor(reauthenticated, clientId);
+    const reauthLoggedIn = await reauthenticated.postForm(reauthLogin.path, {
+      csrf: hidden(reauthLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const reauthConsent = await reachConsentFor(
+      reauthenticated,
+      reauthLoggedIn,
+    );
+    const reapproved = await reauthenticated.postForm(reauthConsent.path, {
+      csrf: hidden(reauthConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(reapproved.status).toBe(303);
+  });
+
+  test("quarantines legacy consent until credential reauthentication", async () => {
     const clientId = await registerClient();
     const login = await loginPage(clientId, "mail.read");
     const loggedIn = await submitLogin(login.path, login.response);
@@ -1030,11 +1343,73 @@ describe("mailcow app-password interactions", () => {
     const freshConsentPath = locationPath(freshResume);
     const freshConsent = await freshSession.get(freshConsentPath);
 
-    expect(freshConsent.status).toBe(200);
-    expect(freshConsent.body).toContain("Authorize mailbox access");
+    expect(freshConsent.status).toBe(401);
+    const [quarantinedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(quarantinedRows[0]?.scopes).toBe('["mail.read"]');
+    expect(quarantinedRows[0]?.revoked).toBe(1);
+    const [accountRows] = await pool.query<
+      Array<RowDataPacket & { accountId: string }>
+    >(
+      `SELECT LOWER(CONCAT(
+         SUBSTR(HEX(id), 1, 8), '-',
+         SUBSTR(HEX(id), 9, 4), '-',
+         SUBSTR(HEX(id), 13, 4), '-',
+         SUBSTR(HEX(id), 17, 4), '-',
+         SUBSTR(HEX(id), 21)
+       )) AS accountId
+       FROM accounts`,
+    );
+    const accountId = accountRows[0]?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    expect(
+      await accountRepository.getCredential(accountId as string),
+    ).toBeNull();
+    expect(
+      await new MariaDbAccountAuthorizationGate(pool).isAccountActive(
+        accountId as string,
+      ),
+    ).toBe(false);
+    const oldSessionRetry = await freshSession.get(
+      authPath(clientId, "mail.read"),
+    );
+    expect(locationPath(oldSessionRetry)).toMatch(/^\/mcp-login\//u);
+
+    const reauthenticated = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const reauthLogin = await loginPageFor(
+      reauthenticated,
+      clientId,
+      "mail.read",
+    );
+    const reauthLoggedIn = await reauthenticated.postForm(reauthLogin.path, {
+      csrf: hidden(reauthLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const reauthConsent = await reachConsentFor(
+      reauthenticated,
+      reauthLoggedIn,
+    );
+    const reapproved = await reauthenticated.postForm(reauthConsent.path, {
+      csrf: hidden(reauthConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(reapproved.status).toBe(303);
+    const [repairedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(repairedRows[0]?.revoked).toBe(0);
+    expect(JSON.parse(repairedRows[0]?.scopes ?? "{}")).toHaveProperty(
+      "authorityEnvelope",
+    );
   });
 
-  test("treats tampered encrypted consent authority as incomplete and re-prompts", async () => {
+  test("quarantines tampered authority without overwriting unknown state", async () => {
     const clientId = await registerClient();
     const login = await loginPage(clientId, "mail.read");
     const loggedIn = await submitLogin(login.path, login.response);
@@ -1049,6 +1424,11 @@ describe("mailcow app-password interactions", () => {
       `UPDATE consents
        SET scopes = JSON_SET(scopes, '$.authorityEnvelope', 'tampered')`,
     );
+    const [tamperedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    const tamperedRaw = tamperedRows[0]?.scopes;
 
     const freshSession = new HttpClient((server.address() as AddressInfo).port);
     const freshStart = await freshSession.get(authPath(clientId, "mail.read"));
@@ -1063,9 +1443,14 @@ describe("mailcow app-password interactions", () => {
     const freshConsentPath = locationPath(freshResume);
     const freshConsent = await freshSession.get(freshConsentPath);
 
-    expect(freshConsent.status).toBe(200);
-    expect(freshConsent.body).toContain("Authorize mailbox access");
+    expect(freshConsent.status).toBe(401);
     expect(freshConsent.body).not.toContain("tampered");
+    const [quarantinedRows] = await pool.query<ConsentRow[]>(
+      `SELECT CAST(scopes AS CHAR) AS scopes, revoked_at IS NOT NULL AS revoked
+       FROM consents`,
+    );
+    expect(quarantinedRows[0]?.scopes).toBe(tamperedRaw);
+    expect(quarantinedRows[0]?.revoked).toBe(1);
   });
 
   test("bounds remembered consent sessions and destroys the evicted provider session", async () => {
@@ -1198,6 +1583,15 @@ describe("mailcow app-password interactions", () => {
     await expect(
       revoker.revokeCredential(accountId as string),
     ).rejects.toThrow();
+    const authorizationGate = new MariaDbAccountAuthorizationGate(pool);
+    expect(await authorizationGate.isAccountActive(accountId as string)).toBe(
+      false,
+    );
+    for (const sessionId of state?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeUndefined();
+    }
+    const survivingSession = await client.get(authPath(clientId, "mail.read"));
+    expect(locationPath(survivingSession)).toMatch(/^\/mcp-login\//u);
     revokeAccessToken.mockRestore();
     await revoker.revokeCredential(accountId as string);
 
