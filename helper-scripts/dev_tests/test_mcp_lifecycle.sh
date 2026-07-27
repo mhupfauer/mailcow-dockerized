@@ -1200,6 +1200,57 @@ EOF
   pass "updater recovers core independently and distinguishes core failure"
 }
 
+test_compose_forwards_mcp_oauth_policy_overrides() {
+  local case_dir="${TEST_DIR}/compose-oauth-policy"
+  local default_config="${case_dir}/mailcow.defaults.conf"
+  local override_config="${case_dir}/mailcow.conf"
+  local compose_json
+  local redirects="https://operator.example.test/oauth/callback,https://backup.example.test/callback?mode=manual"
+  local allow_loopback="0"
+  local registrations_per_hour="37"
+
+  mkdir -p "${case_dir}"
+  write_config "${default_config}" mcp
+  sed \
+    -e "s|^MCP_OAUTH_ALLOWED_REDIRECT_URIS=.*|MCP_OAUTH_ALLOWED_REDIRECT_URIS=${redirects}|" \
+    -e "s|^MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=.*|MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=${allow_loopback}|" \
+    -e "s|^MCP_REGISTRATIONS_PER_HOUR=.*|MCP_REGISTRATIONS_PER_HOUR=${registrations_per_hour}|" \
+    "${default_config}" > "${override_config}"
+  chmod 600 "${override_config}"
+
+  compose_json="$(
+    docker compose \
+      --env-file "${override_config}" \
+      -f "${REPO_DIR}/docker-compose.yml" \
+      --profile mcp \
+      config --format json \
+      2> "${case_dir}/compose.stderr"
+  )" || fail "Compose could not render the MCP profile"
+
+  if ! printf '%s' "${compose_json}" | python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+environment = config["services"]["mcp-mailcow"]["environment"]
+expected = {
+    "MCP_OAUTH_ALLOWED_REDIRECT_URIS": sys.argv[1],
+    "MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS": sys.argv[2],
+    "MCP_REGISTRATIONS_PER_HOUR": sys.argv[3],
+}
+actual = {key: environment.get(key) for key in expected}
+if actual != expected:
+    raise SystemExit(
+        "mcp-mailcow did not preserve OAuth policy overrides: "
+        f"expected={expected!r}, actual={actual!r}"
+    )
+' "${redirects}" "${allow_loopback}" "${registrations_per_hour}"; then
+    fail "Compose did not forward MCP OAuth policy overrides unchanged"
+  fi
+
+  pass "Compose forwards MCP OAuth policy overrides unchanged"
+}
+
 test_mcp_image_release_policy() {
   grep -q 'ghcr.io/mailcow/mcp:0.1.0' "${REPO_DIR}/docker-compose.yml" ||
     fail "Compose does not pin the MCP image release"
@@ -1227,7 +1278,12 @@ if [[ "${MCP_TEST_FOCUS:-}" == purge ]]; then
   test_purge_removes_validated_stopped_app_before_data
   exit 0
 fi
+if [[ "${MCP_TEST_FOCUS:-}" == compose ]]; then
+  test_compose_forwards_mcp_oauth_policy_overrides
+  exit 0
+fi
 
+test_compose_forwards_mcp_oauth_policy_overrides
 test_mcp_image_release_policy
 test_enable_success_and_idempotence
 test_already_enabled_enable_migrates_defaults_without_side_effects

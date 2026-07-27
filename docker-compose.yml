@@ -703,6 +703,9 @@ services:
         - MCP_DBUSER=${MCP_DBUSER:-mailcow_mcp}
         - MCP_DBPASS=${MCP_DBPASS}
         - MCP_ENCRYPTION_KEY=${MCP_ENCRYPTION_KEY}
+        - MCP_OAUTH_ALLOWED_REDIRECT_URIS=${MCP_OAUTH_ALLOWED_REDIRECT_URIS}
+        - MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=${MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS}
+        - MCP_REGISTRATIONS_PER_HOUR=${MCP_REGISTRATIONS_PER_HOUR}
       volumes:
         - mcp-attachments-vol-1:/var/lib/mailcow-mcp/attachments
       networks:
