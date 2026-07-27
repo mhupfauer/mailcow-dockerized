@@ -1,5 +1,13 @@
 import { GenericContainer } from "testcontainers";
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
 
 import { MariaDbAccountRepository } from "../../src/auth/account-repository.js";
 import { AesGcmCredentialVault } from "../../src/auth/crypto-vault.js";
@@ -94,7 +102,7 @@ describe("MariaDbAccountRepository", () => {
     expect(rows[0]).toMatchObject({
       idLength: 16,
       mailbox: "CaseSensitive.Local+Folder@example.test",
-      credentialVersion: 1,
+      credentialVersion: 2,
     });
     expect(rows[0]?.envelope).toMatch(/^v1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]+$/);
     expect(rows[0]?.envelope).not.toContain(appPassword);
@@ -183,6 +191,38 @@ describe("MariaDbAccountRepository", () => {
       mailbox: "revoked.local@example.test",
       appPassword: "reauthorized-password",
     });
+  });
+
+  test("makes the prior authorization epoch unreadable when rotation fails", async () => {
+    const vault = new AesGcmCredentialVault(encryptionKey);
+    const isolatedRepository = new MariaDbAccountRepository(pool, vault);
+    const verified = await isolatedRepository.upsertVerifiedForAuthorization(
+      "rotation-failure@example.test",
+      "verified-password",
+    );
+    const seal = vi
+      .spyOn(vault, "seal")
+      .mockRejectedValueOnce(new Error("vault unavailable"));
+
+    await isolatedRepository.markCredentialRejected(verified.accountId);
+    seal.mockRestore();
+
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await expect(
+        isolatedRepository.getAuthorizationEpochLocked(
+          connection,
+          verified.accountId,
+        ),
+      ).rejects.toThrow("unable to open credential envelope");
+      await connection.rollback();
+    } finally {
+      connection.release();
+    }
+    await expect(
+      isolatedRepository.getCredential(verified.accountId),
+    ).resolves.toBeNull();
   });
 
   test("returns null for an unknown or malformed account identifier", async () => {

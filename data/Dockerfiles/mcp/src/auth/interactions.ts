@@ -15,15 +15,20 @@ import {
   type AccountRepository,
 } from "./account-repository.js";
 import {
+  CleanupPendingAuthorizationError,
   InactiveAuthorizationAccountError,
+  InvalidReauthenticationProofError,
   MariaDbConsentAuthorizationRepository,
+  type AuthorizationMutationCoordinator,
+} from "./authorization-state.js";
+import {
   revokeProviderAuthority,
   revokeProviderAuthorityBestEffort,
-  type AccountAuthorizationGate,
-  type AuthorizationMutationCoordinator,
-  type ConsentAuthorizationState,
-  type ReauthenticationProofStore,
-} from "./authorization-state.js";
+} from "./authorization-revoker.js";
+import type {
+  ConsentAuthorizationState,
+  ReauthenticationBridge,
+} from "./consent-authorization-codec.js";
 import type { CredentialVerifier } from "./credential-verifier.js";
 import { AesGcmCredentialVault } from "./crypto-vault.js";
 import { MCP_OAUTH_SCOPES } from "./oidc-provider.js";
@@ -49,9 +54,8 @@ interface InteractionDependencies {
   maximumLoginQuotaEntries?: number;
   maximumConsentSessions?: number;
   verificationTimeoutMs?: number;
+  pendingReauthenticationTtlMs?: number;
   authorityMutations: AuthorizationMutationCoordinator;
-  reauthenticationProofs: ReauthenticationProofStore;
-  accountAuthorizationGate: AccountAuthorizationGate;
   now?: () => number;
 }
 
@@ -512,7 +516,9 @@ function requestedScopes(
     : null;
 }
 
-function reauthenticationProof(lastSubmission: unknown): string | undefined {
+function reauthenticationBridge(
+  lastSubmission: unknown,
+): ReauthenticationBridge | undefined {
   if (
     typeof lastSubmission !== "object" ||
     lastSubmission === null ||
@@ -524,8 +530,21 @@ function reauthenticationProof(lastSubmission: unknown): string | undefined {
   if (typeof login !== "object" || login === null || Array.isArray(login)) {
     return undefined;
   }
-  const proof = (login as Record<string, unknown>).reauthenticationProof;
-  return typeof proof === "string" && proof !== "" ? proof : undefined;
+  const record = login as Record<string, unknown>;
+  const proof = record.reauthenticationProof;
+  const authorizationEpoch = record.authorizationEpoch;
+  const expiresAt = record.reauthenticationExpiresAt;
+  return typeof proof === "string" &&
+    proof !== "" &&
+    typeof authorizationEpoch === "string" &&
+    authorizationEpoch !== "" &&
+    Number.isSafeInteger(expiresAt)
+    ? {
+        proof,
+        authorizationEpoch,
+        expiresAt: expiresAt as number,
+      }
+    : undefined;
 }
 
 async function finishConsent(
@@ -540,11 +559,15 @@ async function finishConsent(
   currentSessionId: string,
   consentRepository: MariaDbConsentAuthorizationRepository,
   maximumConsentSessions: number,
-  reauthenticationProofValue: string | undefined,
+  bridge: ReauthenticationBridge | undefined,
+  now: number,
   consentScopes: readonly string[] = grantScopes,
 ): Promise<void> {
   const canonicalGrantId =
-    existingState?.kind === "usable" ? existingState.grantId : undefined;
+    existingState?.lifecycle === "active" ||
+    existingState?.lifecycle === "pending_reauth"
+      ? existingState.grantId
+      : undefined;
   let grant =
     canonicalGrantId === undefined
       ? undefined
@@ -556,7 +579,10 @@ async function finishConsent(
   grant.addResourceScope(dependencies.resource.href, grantScopes.join(" "));
   const savedGrantId = await grant.save();
   const sessionIds =
-    existingState?.kind === "usable" ? [...existingState.sessionIds] : [];
+    existingState?.lifecycle === "active" ||
+    existingState?.lifecycle === "pending_reauth"
+      ? [...existingState.sessionIds]
+      : [];
   if (!sessionIds.includes(currentSessionId)) {
     if (sessionIds.length >= maximumConsentSessions) {
       const evictedSessionId = sessionIds.shift();
@@ -571,28 +597,36 @@ async function finishConsent(
     sessionIds.push(currentSessionId);
   }
   try {
-    const reauthenticate =
-      reauthenticationProofValue !== undefined &&
-      dependencies.reauthenticationProofs.bindAndVerify(
-        reauthenticationProofValue,
+    if (existingState?.lifecycle === "pending_reauth") {
+      if (bridge === undefined) {
+        throw new InvalidReauthenticationProofError();
+      }
+      await consentRepository.activatePending(
         accountId,
         clientId,
         dependencies.resource.href,
         currentSessionId,
+        bridge,
+        now,
+        {
+          scopes: consentScopes,
+          grantId: savedGrantId,
+          sessionIds,
+        },
       );
-    if (reauthenticationProofValue !== undefined && !reauthenticate) {
-      throw new InactiveAuthorizationAccountError();
+    } else {
+      await consentRepository.updateActive(
+        accountId,
+        clientId,
+        dependencies.resource.href,
+        {
+          scopes: consentScopes,
+          grantId: savedGrantId,
+          sessionIds,
+        },
+      );
     }
-    await consentRepository.save(accountId, clientId, {
-      scopes: consentScopes,
-      grantId: savedGrantId,
-      sessionIds,
-      reauthenticate,
-    });
   } catch (error) {
-    if (error instanceof InactiveAuthorizationAccountError) {
-      await consentRepository.revoke(accountId, clientId);
-    }
     await revokeProviderAuthorityBestEffort(
       dependencies.provider,
       [
@@ -617,17 +651,6 @@ async function finishConsent(
   );
 }
 
-function unsafeStoredAuthority(
-  state: ConsentAuthorizationState | null,
-  hasReauthenticationProof: boolean,
-): boolean {
-  return (
-    state !== null &&
-    !(state.active && state.kind === "usable") &&
-    !(state.revoked && hasReauthenticationProof)
-  );
-}
-
 async function quarantineUnsafeAuthority(
   dependencies: InteractionDependencies,
   consentRepository: MariaDbConsentAuthorizationRepository,
@@ -635,21 +658,15 @@ async function quarantineUnsafeAuthority(
   clientId: string,
   currentGrantId: string | undefined,
   currentSessionId: string,
-  invalidateProofs: boolean,
 ): Promise<void> {
-  if (invalidateProofs) {
-    dependencies.reauthenticationProofs.invalidateAuthority(
-      accountId,
-      clientId,
-      dependencies.resource.href,
-    );
-  }
-  await dependencies.accountRepository.markCredentialRejected(accountId);
-  await consentRepository.revoke(accountId, clientId);
+  const state = await consentRepository.quarantine(accountId, clientId);
   await revokeProviderAuthorityBestEffort(
     dependencies.provider,
-    currentGrantId === undefined ? [] : [currentGrantId],
-    [currentSessionId],
+    [
+      ...(state?.grantId === undefined ? [] : [state.grantId]),
+      ...(currentGrantId === undefined ? [] : [currentGrantId]),
+    ],
+    [...(state?.sessionIds ?? []), currentSessionId],
   );
 }
 
@@ -660,22 +677,31 @@ async function finishRevocation(
   consentRepository: MariaDbConsentAuthorizationRepository,
   accountId: string,
   clientId: string,
-  state: ConsentAuthorizationState | null,
   currentGrantId: string | undefined,
   currentSessionId: string,
 ): Promise<void> {
-  dependencies.reauthenticationProofs.invalidateAuthority(
+  const cleanup = await consentRepository.beginClientCleanup(
     accountId,
     clientId,
-    dependencies.resource.href,
   );
+  if (cleanup?.lifecycle === "quarantined") {
+    await revokeProviderAuthorityBestEffort(
+      dependencies.provider,
+      [
+        ...(cleanup.grantId === undefined ? [] : [cleanup.grantId]),
+        ...(currentGrantId === undefined ? [] : [currentGrantId]),
+      ],
+      [...cleanup.sessionIds, currentSessionId],
+    );
+    throw new InactiveAuthorizationAccountError();
+  }
   await revokeProviderAuthority(
     dependencies.provider,
     [
-      ...(state?.grantId === undefined ? [] : [state.grantId]),
+      ...(cleanup?.grantId === undefined ? [] : [cleanup.grantId]),
       ...(currentGrantId === undefined ? [] : [currentGrantId]),
     ],
-    (state?.sessionIds ?? []).filter(
+    (cleanup?.sessionIds ?? []).filter(
       (sessionId) => sessionId !== currentSessionId,
     ),
   );
@@ -688,8 +714,10 @@ async function finishRevocation(
     },
     { mergeWithLastSubmission: false },
   );
-  await consentRepository.revoke(accountId, clientId);
   await revokeProviderAuthority(dependencies.provider, [], [currentSessionId]);
+  if (cleanup?.lifecycle === "cleanup_pending") {
+    await consentRepository.completeClientCleanup(accountId, clientId);
+  }
   response.statusCode = 303;
   response.setHeader("Location", returnTo);
   response.setHeader("Content-Length", "0");
@@ -719,6 +747,8 @@ export function createInteractionRouter(
   const verificationTimeoutMs = dependencies.verificationTimeoutMs ?? 15_000;
   const maximumConsentSessions =
     dependencies.maximumConsentSessions ?? defaultMaximumConsentSessions;
+  const pendingReauthenticationTtlMs =
+    dependencies.pendingReauthenticationTtlMs ?? 10 * 60 * 1_000;
   if (
     !Number.isSafeInteger(dependencies.loginAttempts) ||
     dependencies.loginAttempts < 1 ||
@@ -731,7 +761,9 @@ export function createInteractionRouter(
     !Number.isSafeInteger(verificationTimeoutMs) ||
     verificationTimeoutMs < 1 ||
     !Number.isSafeInteger(maximumConsentSessions) ||
-    maximumConsentSessions < 1
+    maximumConsentSessions < 1 ||
+    !Number.isSafeInteger(pendingReauthenticationTtlMs) ||
+    pendingReauthenticationTtlMs < 1
   ) {
     throw new Error("invalid login rate limit");
   }
@@ -750,6 +782,7 @@ export function createInteractionRouter(
   const consentRepository = new MariaDbConsentAuthorizationRepository(
     dependencies.pool,
     new AesGcmCredentialVault(dependencies.encryptionKey),
+    dependencies.resource.href,
   );
 
   const precheckIp: RequestHandler = (request, response, next) => {
@@ -837,26 +870,21 @@ export function createInteractionRouter(
         return;
       }
       try {
-        const storedState = await consentRepository.getStored(
-          accountId,
-          clientId,
-        );
-        const proof = reauthenticationProof(details.lastSubmission);
-        const hasReauthenticationProof =
-          proof !== undefined &&
-          dependencies.reauthenticationProofs.bindAndVerify(
-            proof,
-            accountId,
-            clientId,
-            dependencies.resource.href,
-            sessionId,
-          );
+        const bridge = reauthenticationBridge(details.lastSubmission);
+        const storedState =
+          bridge === undefined
+            ? await consentRepository.getStored(accountId, clientId)
+            : await consentRepository.stagePendingReauthentication(
+                accountId,
+                clientId,
+                dependencies.resource.href,
+                sessionId,
+                bridge,
+                now(),
+              );
         if (
-          storedState === null &&
-          !hasReauthenticationProof &&
-          !(await dependencies.accountAuthorizationGate.isAccountActive(
-            accountId,
-          ))
+          storedState?.needsQuarantine === true ||
+          storedState?.lifecycle === "quarantined"
         ) {
           await quarantineUnsafeAuthority(
             dependencies,
@@ -865,30 +893,38 @@ export function createInteractionRouter(
             clientId,
             details.grantId,
             sessionId,
-            false,
           );
           reject(response, 401, "Reconnect mailbox access.");
           return;
         }
-        if (unsafeStoredAuthority(storedState, hasReauthenticationProof)) {
-          await quarantineUnsafeAuthority(
-            dependencies,
-            consentRepository,
-            accountId,
-            clientId,
-            details.grantId,
-            sessionId,
-            storedState?.revoked !== true,
+        if (storedState?.lifecycle === "cleanup_pending") {
+          renderConsent(response, csrf, scopes);
+          return;
+        }
+        if (
+          storedState === null ||
+          storedState.lifecycle === "revoked" ||
+          (
+            storedState.lifecycle === "pending_reauth" &&
+            bridge === undefined
+          )
+        ) {
+          await revokeProviderAuthorityBestEffort(
+            dependencies.provider,
+            details.grantId === undefined ? [] : [details.grantId],
+            [sessionId],
           );
           reject(response, 401, "Reconnect mailbox access.");
           return;
         }
         const existingState =
-          storedState?.active === true && storedState.kind === "usable"
+          storedState.lifecycle === "active" ||
+          storedState.lifecycle === "pending_reauth"
             ? storedState
             : null;
         if (
           existingState !== null &&
+          existingState.grantId !== undefined &&
           scopes.every((scope) => existingState.scopes.includes(scope))
         ) {
           await finishConsent(
@@ -903,27 +939,22 @@ export function createInteractionRouter(
             sessionId,
             consentRepository,
             maximumConsentSessions,
-            hasReauthenticationProof ? proof : undefined,
+            bridge,
+            now(),
             existingState.scopes,
           );
-          if (hasReauthenticationProof) {
-            dependencies.reauthenticationProofs.consume(
-              proof as string,
-              accountId,
-              clientId,
-              dependencies.resource.href,
-              sessionId,
-            );
-          }
           return;
         }
         renderConsent(response, csrf, scopes);
       } catch (error) {
         if (!response.headersSent) {
+          const denied =
+            error instanceof InactiveAuthorizationAccountError ||
+            error instanceof InvalidReauthenticationProofError;
           reject(
             response,
-            error instanceof InactiveAuthorizationAccountError ? 401 : 503,
-            error instanceof InactiveAuthorizationAccountError
+            denied ? 401 : 503,
+            denied
               ? "Reconnect mailbox access."
               : "Authorization service is unavailable.",
           );
@@ -1022,52 +1053,36 @@ export function createInteractionRouter(
             return;
           }
           reservation.release();
-          let accountId: string | undefined;
           try {
-            accountId = await dependencies.accountRepository.upsertVerified(
-              mailbox,
-              appPassword,
-              false,
-            );
-            const proof = dependencies.reauthenticationProofs.create(
-              accountId,
-              clientId,
-              dependencies.resource.href,
-            );
-            if (proof === null) {
-              await dependencies.accountRepository.markCredentialRejected(
-                accountId,
-              );
-              reject(response, 503, "Authentication service is busy.");
-              return;
-            }
+            const verified =
+              await dependencies.accountRepository
+                .upsertVerifiedForAuthorization(
+                  mailbox,
+                  appPassword,
+                );
+            const proof = randomBytes(32).toString("base64url");
+            const expiresAt = now() + pendingReauthenticationTtlMs;
             await dependencies.provider.interactionFinished(
               request,
               response,
               {
                 login: {
-                  accountId,
+                  accountId: verified.accountId,
                   reauthenticationProof: proof,
+                  authorizationEpoch: verified.authorizationEpoch,
+                  reauthenticationExpiresAt: expiresAt,
                 },
               } as InteractionResults,
               { mergeWithLastSubmission: false },
             );
           } catch {
-            if (accountId !== undefined) {
-              dependencies.reauthenticationProofs.invalidateAuthority(
-                accountId,
-                clientId,
-                dependencies.resource.href,
+            if (!response.headersSent) {
+              reject(
+                response,
+                503,
+                "Authentication service is unavailable.",
               );
-              try {
-                await dependencies.accountRepository.markCredentialRejected(
-                  accountId,
-                );
-              } catch {
-                // The generic service response below must survive cleanup failure.
-              }
             }
-            reject(response, 503, "Authentication service is unavailable.");
           }
           return;
         }
@@ -1100,40 +1115,21 @@ export function createInteractionRouter(
           return;
         }
         try {
-          const storedState = await consentRepository.getStored(
-            accountId,
-            clientId,
-          );
-          if (body.decision === "revoke" && storedState?.revoked === true) {
-            await finishRevocation(
-              request,
-              response,
-              dependencies,
-              consentRepository,
-              accountId,
-              clientId,
-              storedState,
-              details.grantId,
-              sessionId,
-            );
-            return;
-          }
-          const proof = reauthenticationProof(details.lastSubmission);
-          const hasReauthenticationProof =
-            proof !== undefined &&
-            dependencies.reauthenticationProofs.bindAndVerify(
-              proof,
-              accountId,
-              clientId,
-              dependencies.resource.href,
-              sessionId,
-            );
+          const bridge = reauthenticationBridge(details.lastSubmission);
+          const storedState =
+            bridge === undefined
+              ? await consentRepository.getStored(accountId, clientId)
+              : await consentRepository.stagePendingReauthentication(
+                  accountId,
+                  clientId,
+                  dependencies.resource.href,
+                  sessionId,
+                  bridge,
+                  now(),
+                );
           if (
-            storedState === null &&
-            !hasReauthenticationProof &&
-            !(await dependencies.accountAuthorizationGate.isAccountActive(
-              accountId,
-            ))
+            storedState?.needsQuarantine === true ||
+            storedState?.lifecycle === "quarantined"
           ) {
             await quarantineUnsafeAuthority(
               dependencies,
@@ -1142,20 +1138,6 @@ export function createInteractionRouter(
               clientId,
               details.grantId,
               sessionId,
-              false,
-            );
-            reject(response, 401, "Reconnect mailbox access.");
-            return;
-          }
-          if (unsafeStoredAuthority(storedState, hasReauthenticationProof)) {
-            await quarantineUnsafeAuthority(
-              dependencies,
-              consentRepository,
-              accountId,
-              clientId,
-              details.grantId,
-              sessionId,
-              storedState?.revoked !== true,
             );
             reject(response, 401, "Reconnect mailbox access.");
             return;
@@ -1168,7 +1150,6 @@ export function createInteractionRouter(
               consentRepository,
               accountId,
               clientId,
-              storedState,
               details.grantId,
               sessionId,
             );
@@ -1178,8 +1159,22 @@ export function createInteractionRouter(
             reject(response, 400, "Invalid interaction.");
             return;
           }
+          if (storedState?.lifecycle === "cleanup_pending") {
+            throw new CleanupPendingAuthorizationError();
+          }
+          if (
+            storedState === null ||
+            storedState.lifecycle === "revoked" ||
+            (
+              storedState.lifecycle === "pending_reauth" &&
+              bridge === undefined
+            )
+          ) {
+            throw new InactiveAuthorizationAccountError();
+          }
           const existingState =
-            storedState?.active === true && storedState.kind === "usable"
+            storedState.lifecycle === "active" ||
+            storedState.lifecycle === "pending_reauth"
               ? storedState
               : null;
           const existingScopes = existingState?.scopes ?? [];
@@ -1198,24 +1193,19 @@ export function createInteractionRouter(
             sessionId,
             consentRepository,
             maximumConsentSessions,
-            hasReauthenticationProof ? proof : undefined,
+            bridge,
+            now(),
             persistedScopes,
           );
-          if (hasReauthenticationProof) {
-            dependencies.reauthenticationProofs.consume(
-              proof as string,
-              accountId,
-              clientId,
-              dependencies.resource.href,
-              sessionId,
-            );
-          }
         } catch (error) {
           if (!response.headersSent) {
+            const denied =
+              error instanceof InactiveAuthorizationAccountError ||
+              error instanceof InvalidReauthenticationProofError;
             reject(
               response,
-              error instanceof InactiveAuthorizationAccountError ? 401 : 503,
-              error instanceof InactiveAuthorizationAccountError
+              denied ? 401 : 503,
+              denied
                 ? "Reconnect mailbox access."
                 : "Authorization service is unavailable.",
             );

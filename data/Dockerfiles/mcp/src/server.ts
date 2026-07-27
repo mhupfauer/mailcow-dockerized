@@ -7,8 +7,6 @@ import { createApp } from "./app.js";
 import { MariaDbAccountRepository } from "./auth/account-repository.js";
 import {
   BoundedAuthorizationMutationCoordinator,
-  BoundedReauthenticationProofStore,
-  MariaDbAccountAuthorizationGate,
 } from "./auth/authorization-state.js";
 import { DualProtocolCredentialVerifier } from "./auth/credential-verifier.js";
 import { AesGcmCredentialVault } from "./auth/crypto-vault.js";
@@ -98,11 +96,6 @@ export async function startProductionServer(
     const authorityMutations = new BoundedAuthorizationMutationCoordinator(
       1_000,
     );
-    const reauthenticationProofs = new BoundedReauthenticationProofStore(
-      10_000,
-      10 * 60 * 1_000,
-    );
-    const accountAuthorizationGate = new MariaDbAccountAuthorizationGate(pool);
     const credentialVerifier = new DualProtocolCredentialVerifier({
       hostname: config.hostname,
       ca: trustSource,
@@ -125,8 +118,6 @@ export async function startProductionServer(
         loginAttempts: config.loginAttempts,
         loginWindowSeconds: config.loginWindowSeconds,
         authorityMutations,
-        reauthenticationProofs,
-        accountAuthorizationGate,
       },
     });
     const server = await listen(app, options.port ?? config.port);
