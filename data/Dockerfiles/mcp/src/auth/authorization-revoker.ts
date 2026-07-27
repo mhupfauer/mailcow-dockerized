@@ -94,7 +94,10 @@ export class MariaDbAccountAuthorizationRevoker {
           state.grantId === undefined ? [] : [state.grantId],
           state.sessionIds,
         );
-        if (state.lifecycle === "cleanup_pending") {
+        if (
+          state.lifecycle === "cleanup_pending" ||
+          state.lifecycle === "cleanup_finalizing"
+        ) {
           await this.consentRepository.completeClientCleanup(
             accountId,
             state.clientId,

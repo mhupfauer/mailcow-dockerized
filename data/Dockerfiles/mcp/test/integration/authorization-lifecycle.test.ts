@@ -218,6 +218,7 @@ describe("mailcow authorization lifecycle", () => {
               reauthenticationProof?: unknown;
               authorizationEpoch?: unknown;
               reauthenticationExpiresAt?: unknown;
+              reauthenticationBinding?: unknown;
             };
           }
         ).login;
@@ -230,6 +231,10 @@ describe("mailcow authorization lifecycle", () => {
             proof: login.reauthenticationProof,
             authorizationEpoch: login.authorizationEpoch,
             expiresAt: login.reauthenticationExpiresAt as number,
+            bindingEnvelope:
+              typeof login.reauthenticationBinding === "string"
+                ? login.reauthenticationBinding
+                : "",
           };
         }
         return originalFinished(...args);
@@ -237,6 +242,7 @@ describe("mailcow authorization lifecycle", () => {
     const login = await loginPage(clientId);
     const loggedIn = await submitLogin(login.path, login.response);
     expect(bridge).toBeDefined();
+    finished.mockRestore();
     const resume = await client.get(locationPath(loggedIn));
     const consentPath = locationPath(resume);
     const consent = await client.get(consentPath);
@@ -252,9 +258,25 @@ describe("mailcow authorization lifecycle", () => {
     expect(sessionUid).toBeTypeOf("string");
 
     const rawPending = await rawConsent(accountId, clientId);
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        accountId,
+        clientId,
+        resource.href,
+        `${sessionUid as string}-different`,
+        bridge!,
+        Date.now(),
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    expect(
+      (await consentRepository.getStored(accountId, clientId))
+        ?.pendingReauthentication?.sessionUid,
+    ).toBe(sessionUid);
+    expect(bridge!.bindingEnvelope).not.toBe("");
     for (const secret of [
       bridge!.proof,
       bridge!.authorizationEpoch,
+      bridge!.bindingEnvelope,
       sessionUid as string,
     ]) {
       expect(rawPending).not.toContain(secret);
@@ -289,7 +311,6 @@ describe("mailcow authorization lifecycle", () => {
       decision: "approve",
     });
     expect(approved.status).toBe(303);
-    finished.mockRestore();
     const active = await consentRepository.getActive(accountId, clientId);
     expect(active).not.toBeNull();
     await expect(
@@ -313,7 +334,363 @@ describe("mailcow authorization lifecycle", () => {
     expect(rawActive).not.toContain(sessionUid as string);
   });
 
-  test("bounds parallel current-epoch reauthentication to one client row", async () => {
+  test("repository rejects bridge transplant and retains bounded replay and displaced-Session state", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "repository@example.test",
+      "app-password",
+    );
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+      {
+        maximumSessions: 2,
+        maximumRetiredReauthenticationBridges: 1,
+      },
+    );
+    const clientId = "repository-client";
+    const firstBridge =
+      await consentRepository.issueReauthenticationBridge(
+        verified.accountId,
+        clientId,
+        resource.href,
+        {
+          proof: "a".repeat(43),
+          authorizationEpoch: verified.authorizationEpoch,
+          expiresAt: 100,
+        },
+      );
+    const secondBridge =
+      await consentRepository.issueReauthenticationBridge(
+        verified.accountId,
+        clientId,
+        resource.href,
+        {
+          proof: "b".repeat(43),
+          authorizationEpoch: verified.authorizationEpoch,
+          expiresAt: 100,
+        },
+      );
+    const thirdBridge =
+      await consentRepository.issueReauthenticationBridge(
+        verified.accountId,
+        clientId,
+        resource.href,
+        {
+          proof: "c".repeat(43),
+          authorizationEpoch: verified.authorizationEpoch,
+          expiresAt: 200,
+        },
+      );
+
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        "other-client",
+        resource.href,
+        "session-one",
+        firstBridge,
+        0,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        "https://other.example.test/mcp",
+        "session-one",
+        firstBridge,
+        0,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "session-one",
+      firstBridge,
+      0,
+    );
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "session-one",
+      firstBridge,
+      0,
+    );
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "session-transplant",
+        firstBridge,
+        0,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+
+    const superseded = await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "session-two",
+      secondBridge,
+      0,
+    );
+    expect(superseded.sessionIds).toEqual(["session-one"]);
+    expect(superseded.retiredReauthenticationBridges).toHaveLength(1);
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "session-three",
+        thirdBridge,
+        0,
+      ),
+    ).rejects.toThrow("reauthentication bridge capacity is exhausted");
+    expect(
+      (await consentRepository.getStored(verified.accountId, clientId))
+        ?.pendingReauthentication?.sessionUid,
+    ).toBe("session-two");
+
+    const pruned = await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "session-three",
+      thirdBridge,
+      101,
+    );
+    expect(pruned.sessionIds).toEqual(["session-one", "session-two"]);
+    expect(pruned.retiredReauthenticationBridges).toEqual([]);
+    await consentRepository.activatePending(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "session-three",
+      thirdBridge,
+      101,
+      {
+        scopes: ["mail.read"],
+        grantId: "repository-grant",
+        sessionIds: ["session-one", "session-two"],
+      },
+    );
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "session-three",
+        thirdBridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await consentRepository.beginClientCleanup(
+      verified.accountId,
+      clientId,
+    );
+    await consentRepository.completeClientCleanup(
+      verified.accountId,
+      clientId,
+    );
+    const revoked = await consentRepository.getStored(
+      verified.accountId,
+      clientId,
+    );
+    expect(revoked).toMatchObject({
+      lifecycle: "revoked",
+      retiredReauthenticationBridges: [
+        {
+          expiresAt: 200,
+        },
+      ],
+    });
+    const revokedRaw = await rawConsent(verified.accountId, clientId);
+    for (const retired of revoked?.retiredReauthenticationBridges ?? []) {
+      expect(revokedRaw).not.toContain(retired.fingerprint);
+    }
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "session-after-cleanup",
+        thirdBridge,
+        103,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+  });
+
+  test("superseding an abandoned same-client reauthentication tracks both Sessions and rejects the old bridge", async () => {
+    const clientId = await registerClient();
+    const bridges: ReauthenticationBridge[] = [];
+    const originalFinished = provider.interactionFinished.bind(provider);
+    const finished = vi
+      .spyOn(provider, "interactionFinished")
+      .mockImplementation(async (...args) => {
+        const login = (
+          args[2] as {
+            login?: {
+              reauthenticationProof?: unknown;
+              authorizationEpoch?: unknown;
+              reauthenticationExpiresAt?: unknown;
+              reauthenticationBinding?: unknown;
+            };
+          }
+        ).login;
+        if (
+          typeof login?.reauthenticationProof === "string" &&
+          typeof login.authorizationEpoch === "string" &&
+          Number.isSafeInteger(login.reauthenticationExpiresAt)
+        ) {
+          bridges.push({
+            proof: login.reauthenticationProof,
+            authorizationEpoch: login.authorizationEpoch,
+            expiresAt: login.reauthenticationExpiresAt as number,
+            bindingEnvelope:
+              typeof login.reauthenticationBinding === "string"
+                ? login.reauthenticationBinding
+                : "",
+          });
+        }
+        return originalFinished(...args);
+      });
+    const port = (server.address() as AddressInfo).port;
+    const firstClient = new HttpClient(port);
+    const secondClient = new HttpClient(port);
+    const firstLogin = await loginPageFor(firstClient, clientId);
+    const firstLoggedIn = await firstClient.postForm(firstLogin.path, {
+      csrf: hidden(firstLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const firstConsent = await reachConsentFor(firstClient, firstLoggedIn);
+    const accountId = await accountIdForMailbox();
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const firstPending = await consentRepository.getStored(accountId, clientId);
+    const firstSessionUid =
+      firstPending?.pendingReauthentication?.sessionUid;
+    expect(firstSessionUid).toBeTypeOf("string");
+
+    const secondLogin = await loginPageFor(secondClient, clientId);
+    const secondLoggedIn = await secondClient.postForm(secondLogin.path, {
+      csrf: hidden(secondLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    finished.mockRestore();
+    expect(bridges).toHaveLength(2);
+    const secondConsent = await reachConsentFor(secondClient, secondLoggedIn);
+    const superseded = await consentRepository.getStored(accountId, clientId);
+    const secondSessionUid =
+      superseded?.pendingReauthentication?.sessionUid;
+
+    expect(secondSessionUid).toBeTypeOf("string");
+    expect(secondSessionUid).not.toBe(firstSessionUid);
+    expect(superseded?.sessionIds).toContain(firstSessionUid);
+    expect(superseded?.retiredReauthenticationBridges).toHaveLength(1);
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        accountId,
+        clientId,
+        resource.href,
+        firstSessionUid as string,
+        bridges[0]!,
+        Date.now(),
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+
+    const approved = await secondClient.postForm(secondConsent.path, {
+      csrf: hidden(secondConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(approved.status).toBe(303);
+    const callback = await secondClient.get(locationPath(approved));
+    const code = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const grantId = authorizationCode?.grantId;
+    expect(grantId).toBeTypeOf("string");
+    const active = await consentRepository.getActive(accountId, clientId);
+    expect(active?.sessionIds).toEqual(
+      expect.arrayContaining([
+        firstSessionUid as string,
+        secondSessionUid as string,
+      ]),
+    );
+    expect(active?.retiredReauthenticationBridges).toHaveLength(2);
+    const raw = await rawConsent(accountId, clientId);
+    for (const secret of [
+      bridges[0]!.proof,
+      bridges[0]!.bindingEnvelope,
+      bridges[1]!.proof,
+      bridges[1]!.bindingEnvelope,
+      firstSessionUid as string,
+      secondSessionUid as string,
+    ]) {
+      expect(raw).not.toContain(secret);
+    }
+
+    await new MariaDbAccountAuthorizationRevoker(
+      consentRepository,
+      provider,
+      authorityMutations,
+      resource.href,
+    ).revokeCredential(accountId);
+
+    expect(await consentRepository.getStored(accountId, clientId)).toMatchObject(
+      {
+        lifecycle: "revoked",
+        sessionIds: [],
+      },
+    );
+    expect(
+      await provider.Session.findByUid(firstSessionUid as string),
+    ).toBeUndefined();
+    expect(
+      await provider.Session.findByUid(secondSessionUid as string),
+    ).toBeUndefined();
+    expect(await provider.Grant.find(grantId as string)).toBeUndefined();
+    expect(
+      await provider.AuthorizationCode.find(code as string),
+    ).toBeUndefined();
+    const [authorityRows] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count
+       FROM oidc_objects
+       WHERE model IN (
+         'Grant',
+         'Session',
+         'AccessToken',
+         'RefreshToken',
+         'AuthorizationCode'
+       )`,
+    );
+    expect(authorityRows[0]?.count).toBe(0);
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        accountId,
+        clientId,
+        resource.href,
+        "replayed-session",
+        bridges[0]!,
+        Date.now(),
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    expect(firstConsent.response.status).toBe(200);
+  });
+
+  test("bounds parallel current-epoch reauthentication to one row and rejects the displaced bridge", async () => {
     const clientId = await registerClient();
     const firstLogin = await loginPage(clientId);
     const firstLoggedIn = await submitLogin(firstLogin.path, firstLogin.response);
@@ -347,7 +724,7 @@ describe("mailcow authorization lifecycle", () => {
       csrf: hidden(secondConsent.response.body, "csrf"),
       decision: "approve",
     });
-    expect(firstApproved.status).toBe(303);
+    expect(firstApproved.status).toBe(401);
     expect(secondApproved.status).toBe(303);
     expect(secondConsent.response.status).toBe(200);
     expect(interactionState.protocolAttempts).toHaveLength(2);
@@ -681,6 +1058,254 @@ describe("mailcow authorization lifecycle", () => {
     expect(afterRevocationPath).toMatch(/^\/mcp-login\//u);
   });
 
+  test("durably finalizes explicit cleanup after bookkeeping fails following current-Session destruction", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    const grantId = authorizationCode?.grantId;
+    expect(accountId).toBeTypeOf("string");
+    expect(grantId).toBeTypeOf("string");
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const active = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(active?.sessionIds).toHaveLength(1);
+
+    const revocationStart = await client.get(
+      authPath(clientId, "mail.read mail.send"),
+    );
+    const revocationPath = locationPath(revocationStart);
+    const revocation = await client.get(revocationPath);
+    expect(revocation.status).toBe(200);
+    const revokeForm = {
+      csrf: hidden(revocation.body, "csrf"),
+      decision: "revoke",
+    };
+    const originalInteractionResult = provider.interactionResult.bind(provider);
+    let stagedReturnTo: string | undefined;
+    const interactionResult = vi
+      .spyOn(provider, "interactionResult")
+      .mockImplementation(async (...args) => {
+        stagedReturnTo = await originalInteractionResult(...args);
+        return stagedReturnTo;
+      });
+    let observedFinalizing:
+      | Awaited<ReturnType<typeof consentRepository.getStored>>
+      | undefined;
+    let observedSessionPresence: boolean[] = [];
+    const complete = vi
+      .spyOn(
+        MariaDbConsentAuthorizationRepository.prototype,
+        "completeClientCleanup",
+      )
+      .mockImplementationOnce(async (storedAccountId, storedClientId) => {
+        observedFinalizing = await consentRepository.getStored(
+          storedAccountId,
+          storedClientId,
+        );
+        observedSessionPresence = await Promise.all(
+          (observedFinalizing?.sessionIds ?? []).map(
+            async (sessionId) =>
+              (await provider.Session.findByUid(sessionId)) !== undefined,
+          ),
+        );
+        throw new Error("database unavailable after current Session destroy");
+      });
+
+    const unavailable = await client.postForm(revocationPath, revokeForm);
+    complete.mockRestore();
+    interactionResult.mockRestore();
+
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers["cache-control"]).toContain("no-store");
+    expect(unavailable.headers.location).toBeUndefined();
+    expect(unavailable.body).not.toContain("database unavailable");
+    expect(stagedReturnTo).toBeTypeOf("string");
+    expect(observedFinalizing).toMatchObject({
+      lifecycle: "cleanup_finalizing",
+      cleanupReturnTo: stagedReturnTo,
+    });
+    expect(observedSessionPresence).not.toHaveLength(0);
+    expect(observedSessionPresence.every((present) => !present)).toBe(true);
+    const retainedRaw = await rawConsent(accountId as string, clientId);
+    expect(JSON.parse(retainedRaw)).toMatchObject({
+      version: 2,
+      lifecycle: "cleanup_finalizing",
+    });
+    expect(retainedRaw).not.toContain(stagedReturnTo as string);
+    for (const sessionId of observedFinalizing?.sessionIds ?? []) {
+      expect(retainedRaw).not.toContain(sessionId);
+      expect(await provider.Session.findByUid(sessionId)).toBeUndefined();
+    }
+    expect(await provider.Grant.find(grantId as string)).toBeUndefined();
+    expect(
+      await provider.AuthorizationCode.find(code as string),
+    ).toBeUndefined();
+
+    const strandedRetry = await client.postForm(revocationPath, revokeForm);
+    expect(strandedRetry.status).not.toBe(303);
+    expect(
+      (await consentRepository.getStored(accountId as string, clientId))
+        ?.lifecycle,
+    ).toBe("cleanup_finalizing");
+
+    const finalizerClient = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const finalizerLogin = await loginPageFor(finalizerClient, clientId);
+    const finalizerLoggedIn = await finalizerClient.postForm(
+      finalizerLogin.path,
+      {
+        csrf: hidden(finalizerLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      },
+    );
+    const finalizerResume = await finalizerClient.get(
+      locationPath(finalizerLoggedIn),
+    );
+    const finalizerPath = locationPath(finalizerResume);
+    const finalized = await finalizerClient.get(finalizerPath);
+
+    expect(finalized.status).toBe(401);
+    expect(finalized.headers["cache-control"]).toContain("no-store");
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "revoked",
+      sessionIds: [],
+    });
+    const [remainingAuthority] = await pool.query<CountRow[]>(
+      `SELECT COUNT(*) AS count
+       FROM oidc_objects
+       WHERE model IN (
+         'Grant',
+         'Session',
+         'AccessToken',
+         'RefreshToken',
+         'AuthorizationCode'
+       )`,
+    );
+    expect(remainingAuthority[0]?.count).toBe(0);
+
+    const reconnect = new HttpClient((server.address() as AddressInfo).port);
+    const reconnectLogin = await loginPageFor(reconnect, clientId);
+    const reconnectLoggedIn = await reconnect.postForm(reconnectLogin.path, {
+      csrf: hidden(reconnectLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const reconnectConsent = await reachConsentFor(
+      reconnect,
+      reconnectLoggedIn,
+    );
+    const reapproved = await reconnect.postForm(reconnectConsent.path, {
+      csrf: hidden(reconnectConsent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(reapproved.status).toBe(303);
+  });
+
+  test("account-wide revocation completes a retained finalization outbox without a provider Session", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    const grantId = authorizationCode?.grantId;
+    expect(accountId).toBeTypeOf("string");
+    expect(grantId).toBeTypeOf("string");
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const active = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(active?.sessionIds).toHaveLength(1);
+    const returnTo = new URL(
+      "/oauth/auth/retained-provider-result",
+      issuer,
+    ).href;
+    await consentRepository.beginClientCleanup(
+      accountId as string,
+      clientId,
+      active?.sessionIds[0],
+    );
+    await consentRepository.stageClientCleanupFinalization(
+      accountId as string,
+      clientId,
+      returnTo,
+    );
+    for (const sessionId of active?.sessionIds ?? []) {
+      const session = await provider.Session.findByUid(sessionId);
+      await session?.destroy();
+    }
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "cleanup_finalizing",
+      cleanupReturnTo: returnTo,
+    });
+    expect(await rawConsent(accountId as string, clientId)).not.toContain(
+      returnTo,
+    );
+
+    await new MariaDbAccountAuthorizationRevoker(
+      consentRepository,
+      provider,
+      authorityMutations,
+      resource.href,
+    ).revokeCredential(accountId as string);
+
+    expect(
+      await new MariaDbAccountAuthorizationGate(pool).isAccountActive(
+        accountId as string,
+      ),
+    ).toBe(false);
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "revoked",
+      sessionIds: [],
+    });
+    expect(await provider.Grant.find(grantId as string)).toBeUndefined();
+    expect(
+      await provider.AuthorizationCode.find(code as string),
+    ).toBeUndefined();
+  });
+
   test("serializes parallel first approvals onto one canonical grant", async () => {
     const clientId = await registerClient();
     const port = (server.address() as AddressInfo).port;
@@ -720,8 +1345,10 @@ describe("mailcow authorization lifecycle", () => {
     ]);
     save.mockRestore();
 
-    expect(firstApproved.status).toBe(303);
-    expect(secondApproved.status).toBe(303);
+    expect([firstApproved.status, secondApproved.status].sort()).toEqual([
+      303,
+      401,
+    ]);
     const [grantRows] = await pool.query<CountRow[]>(
       `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Grant'`,
     );
@@ -730,12 +1357,18 @@ describe("mailcow authorization lifecycle", () => {
       `SELECT COUNT(*) AS count FROM oidc_objects WHERE model = 'Session'`,
     );
     expect(sessionRows[0]?.count).toBe(2);
-    const firstCallback = await firstClient.get(locationPath(firstApproved));
-    const firstCode = new URL(
-      firstCallback.headers.location as string,
+    const successful =
+      firstApproved.status === 303
+        ? { client: firstClient, response: firstApproved }
+        : { client: secondClient, response: secondApproved };
+    const callback = await successful.client.get(
+      locationPath(successful.response),
+    );
+    const code = new URL(
+      callback.headers.location as string,
     ).searchParams.get("code");
     const authorizationCode = await provider.AuthorizationCode.find(
-      firstCode as string,
+      code as string,
     );
     const state = await new MariaDbConsentAuthorizationRepository(
       pool,
@@ -1210,24 +1843,14 @@ describe("mailcow authorization lifecycle", () => {
     );
     const revocationPath = locationPath(revocationStart);
     const revocation = await client.get(revocationPath);
-    let sessionFinds = 0;
-    const originalFindSession = provider.Session.findByUid.bind(
-      provider.Session,
-    );
-    const findSession = vi
-      .spyOn(provider.Session, "findByUid")
-      .mockImplementation(async (sessionUid) => {
-        sessionFinds += 1;
-        if (sessionFinds === 3) {
-          throw new Error("session adapter unavailable");
-        }
-        return originalFindSession(sessionUid);
-      });
+    const revokeAccessToken = vi
+      .spyOn(provider.AccessToken, "revokeByGrantId")
+      .mockRejectedValueOnce(new Error("token adapter unavailable"));
     const unavailable = await client.postForm(revocationPath, {
       csrf: hidden(revocation.body, "csrf"),
       decision: "revoke",
     });
-    findSession.mockRestore();
+    revokeAccessToken.mockRestore();
     expect(unavailable.status).toBe(503);
     const retained = await rawConsent(accountId, clientId);
 
@@ -1741,7 +2364,7 @@ describe("mailcow authorization lifecycle", () => {
     const retryRaw = retryRows[0]?.scopes;
     expect(JSON.parse(retryRaw ?? "{}")).toMatchObject({
       version: 2,
-      lifecycle: "cleanup_pending",
+      lifecycle: "cleanup_finalizing",
     });
 
     const retried = await client.postForm(revocationPath, revokeForm);

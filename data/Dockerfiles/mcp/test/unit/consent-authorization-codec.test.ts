@@ -67,4 +67,65 @@ describe("ConsentAuthorizationCodec", () => {
       }),
     ).rejects.toThrow("invalid consent resource");
   });
+
+  test("binds a reauthentication bridge to one exact authority before any Session exists", async () => {
+    const codec = new ConsentAuthorizationCodec(
+      new AesGcmCredentialVault(encryptionKey),
+      resource,
+    );
+    const bridge = await codec.issueReauthenticationBridge(
+      accountId,
+      clientId,
+      resource,
+      {
+        proof: "p".repeat(43),
+        authorizationEpoch: "authorization-epoch",
+        expiresAt: 1_000,
+      },
+    );
+
+    const first = await codec.verifyReauthenticationBridge(
+      accountId,
+      clientId,
+      resource,
+      bridge,
+    );
+    const second = await codec.verifyReauthenticationBridge(
+      accountId,
+      clientId,
+      resource,
+      bridge,
+    );
+
+    expect(first).toEqual(second);
+    expect(first.fingerprint).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(first).toMatchObject({
+      authorizationEpoch: "authorization-epoch",
+      expiresAt: 1_000,
+    });
+    await expect(
+      codec.verifyReauthenticationBridge(
+        "00d84f89-0f41-4d3a-a069-50c383e7b26f",
+        clientId,
+        resource,
+        bridge,
+      ),
+    ).rejects.toThrow("invalid reauthentication bridge");
+    await expect(
+      codec.verifyReauthenticationBridge(
+        accountId,
+        "other-client",
+        resource,
+        bridge,
+      ),
+    ).rejects.toThrow("invalid reauthentication bridge");
+    await expect(
+      codec.verifyReauthenticationBridge(
+        accountId,
+        clientId,
+        "https://other.example.test/mcp",
+        bridge,
+      ),
+    ).rejects.toThrow("invalid reauthentication bridge");
+  });
 });

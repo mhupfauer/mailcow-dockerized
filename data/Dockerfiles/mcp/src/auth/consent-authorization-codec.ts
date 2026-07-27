@@ -8,11 +8,15 @@ const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const proofPattern = /^[A-Za-z0-9_-]{32,256}$/u;
 const digestPattern = /^[A-Za-z0-9_-]{43}$/u;
+const bridgeEnvelopePattern = /^v1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]+$/u;
+const maximumBridgeEnvelopeLength = 4_096;
+const maximumStoredRetiredBridges = 1_024;
 
 export type ConsentLifecycle =
   | "pending_reauth"
   | "active"
   | "cleanup_pending"
+  | "cleanup_finalizing"
   | "quarantined"
   | "revoked";
 
@@ -20,10 +24,28 @@ export interface ReauthenticationBridge {
   proof: string;
   authorizationEpoch: string;
   expiresAt: number;
+  bindingEnvelope: string;
+}
+
+export interface ReauthenticationBridgeClaims {
+  proof: string;
+  authorizationEpoch: string;
+  expiresAt: number;
+}
+
+export interface VerifiedReauthenticationBridge {
+  fingerprint: string;
+  authorizationEpoch: string;
+  expiresAt: number;
+}
+
+export interface RetiredReauthenticationBridge {
+  fingerprint: string;
+  expiresAt: number;
 }
 
 export interface PendingReauthenticationAuthority {
-  proofDigest: string;
+  bridgeFingerprint: string;
   authorizationEpoch: string;
   sessionUid: string;
   expiresAt: number;
@@ -45,7 +67,9 @@ interface ConsentAuthorityV2 {
   grantId?: string;
   sessionIds: string[];
   pendingReauthentication?: PendingReauthenticationAuthority;
+  retiredReauthenticationBridges?: RetiredReauthenticationBridge[];
   consumedProofDigest?: string;
+  cleanupReturnTo?: string;
   evidence?: string;
 }
 
@@ -54,6 +78,16 @@ interface ConsentAuthorityV1 {
   clientId: string;
   grantId: string;
   sessionIds: string[];
+}
+
+interface ReauthenticationBridgeBindingV1 {
+  version: 1;
+  accountId: string;
+  clientId: string;
+  resource: string;
+  proof: string;
+  authorizationEpoch: string;
+  expiresAt: number;
 }
 
 export interface EncodedConsentRow {
@@ -74,9 +108,11 @@ export interface ConsentAuthorizationState {
     sessionUid: string;
     expiresAt: number;
   };
-  pendingProofDigest?: string;
+  pendingBridgeFingerprint?: string;
   pendingAuthorizationEpoch?: string;
+  retiredReauthenticationBridges?: RetiredReauthenticationBridge[];
   consumedProofDigest?: string;
+  cleanupReturnTo?: string;
   quarantineEvidence?: string;
   needsQuarantine?: boolean;
 }
@@ -97,7 +133,11 @@ export function validReauthenticationBridge(
   return (
     proofPattern.test(bridge.proof) &&
     bridge.authorizationEpoch !== "" &&
-    Number.isSafeInteger(bridge.expiresAt)
+    Number.isSafeInteger(bridge.expiresAt) &&
+    bridge.expiresAt > 0 &&
+    typeof bridge.bindingEnvelope === "string" &&
+    bridge.bindingEnvelope.length <= maximumBridgeEnvelopeLength &&
+    bridgeEnvelopePattern.test(bridge.bindingEnvelope)
   );
 }
 
@@ -118,6 +158,7 @@ function validLifecycle(value: unknown): value is ConsentLifecycle {
     value === "pending_reauth" ||
     value === "active" ||
     value === "cleanup_pending" ||
+    value === "cleanup_finalizing" ||
     value === "quarantined" ||
     value === "revoked"
   );
@@ -130,27 +171,11 @@ function authorityRecordType(clientId: string): string {
   return `consent-authority:${clientHash}`;
 }
 
-export function reauthenticationProofDigest(
-  bridge: ReauthenticationBridge,
-  accountId: string,
-  clientId: string,
-  resource: string,
-  sessionUid: string,
-): string {
-  return createHash("sha256")
-    .update(
-      [
-        accountId,
-        clientId,
-        resource,
-        sessionUid,
-        bridge.authorizationEpoch,
-        bridge.expiresAt.toString(),
-        bridge.proof,
-      ].join("\u0000"),
-      "utf8",
-    )
+function reauthenticationBridgeRecordType(clientId: string): string {
+  const clientHash = createHash("sha256")
+    .update(clientId, "utf8")
     .digest("base64url");
+  return `reauthentication-bridge:${clientHash}`;
 }
 
 function parseStoredV2(value: string): StoredConsentV2 | null {
@@ -218,9 +243,13 @@ function parsePending(
     return undefined;
   }
   const record = value as Record<string, unknown>;
+  const bridgeFingerprint =
+    typeof record.bridgeFingerprint === "string"
+      ? record.bridgeFingerprint
+      : record.proofDigest;
   if (
-    typeof record.proofDigest !== "string" ||
-    !digestPattern.test(record.proofDigest) ||
+    typeof bridgeFingerprint !== "string" ||
+    !digestPattern.test(bridgeFingerprint) ||
     typeof record.authorizationEpoch !== "string" ||
     record.authorizationEpoch === "" ||
     typeof record.sessionUid !== "string" ||
@@ -231,11 +260,58 @@ function parsePending(
     return undefined;
   }
   return {
-    proofDigest: record.proofDigest,
+    bridgeFingerprint,
     authorizationEpoch: record.authorizationEpoch,
     sessionUid: record.sessionUid,
     expiresAt: record.expiresAt as number,
   };
+}
+
+function parseRetiredReauthenticationBridges(
+  value: unknown,
+): RetiredReauthenticationBridge[] | null {
+  if (value === undefined) {
+    return [];
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length > maximumStoredRetiredBridges
+  ) {
+    return null;
+  }
+  const retired: RetiredReauthenticationBridge[] = [];
+  const fingerprints = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return null;
+    }
+    const record = item as Record<string, unknown>;
+    if (
+      typeof record.fingerprint !== "string" ||
+      !digestPattern.test(record.fingerprint) ||
+      !Number.isSafeInteger(record.expiresAt) ||
+      (record.expiresAt as number) < 1 ||
+      fingerprints.has(record.fingerprint)
+    ) {
+      return null;
+    }
+    fingerprints.add(record.fingerprint);
+    retired.push({
+      fingerprint: record.fingerprint,
+      expiresAt: record.expiresAt as number,
+    });
+  }
+  return retired.sort((first, second) => {
+    const expiryOrder = first.expiresAt - second.expiresAt;
+    if (expiryOrder !== 0) {
+      return expiryOrder;
+    }
+    return first.fingerprint < second.fingerprint
+      ? -1
+      : first.fingerprint > second.fingerprint
+        ? 1
+        : 0;
+  });
 }
 
 function parseAuthorityV2(
@@ -275,12 +351,24 @@ function parseAuthorityV2(
       (
         record.evidence !== undefined &&
         typeof record.evidence !== "string"
+      ) ||
+      (
+        record.cleanupReturnTo !== undefined &&
+        (
+          typeof record.cleanupReturnTo !== "string" ||
+          record.cleanupReturnTo === ""
+        )
       )
     ) {
       return null;
     }
     const pending = parsePending(record.pendingReauthentication);
+    const retiredReauthenticationBridges =
+      parseRetiredReauthenticationBridges(
+        record.retiredReauthenticationBridges,
+      );
     if (
+      retiredReauthenticationBridges === null ||
       (record.lifecycle === "pending_reauth" && pending === undefined) ||
       (
         record.lifecycle !== "pending_reauth" &&
@@ -291,8 +379,19 @@ function parseAuthorityV2(
         (typeof record.grantId !== "string" || sessionIds.length === 0)
       ) ||
       (
+        record.lifecycle === "cleanup_finalizing" &&
+        typeof record.cleanupReturnTo !== "string"
+      ) ||
+      (
+        record.lifecycle !== "cleanup_finalizing" &&
+        record.cleanupReturnTo !== undefined
+      ) ||
+      (
         record.lifecycle === "revoked" &&
-        (record.grantId !== undefined || sessionIds.length !== 0)
+        (
+          record.grantId !== undefined ||
+          sessionIds.length !== 0
+        )
       ) ||
       (
         record.lifecycle === "quarantined" &&
@@ -312,8 +411,14 @@ function parseAuthorityV2(
         : {}),
       sessionIds: [...new Set(sessionIds as string[])],
       ...(pending === undefined ? {} : { pendingReauthentication: pending }),
+      ...(retiredReauthenticationBridges.length === 0
+        ? {}
+        : { retiredReauthenticationBridges }),
       ...(typeof record.consumedProofDigest === "string"
         ? { consumedProofDigest: record.consumedProofDigest }
+        : {}),
+      ...(typeof record.cleanupReturnTo === "string"
+        ? { cleanupReturnTo: record.cleanupReturnTo }
         : {}),
       ...(typeof record.evidence === "string"
         ? { evidence: record.evidence }
@@ -338,6 +443,8 @@ function stateFromAuthority(
       : { grantId: authority.grantId }),
     sessionIds: authority.sessionIds,
     accountActive,
+    retiredReauthenticationBridges:
+      authority.retiredReauthenticationBridges ?? [],
     ...(authority.pendingReauthentication === undefined
       ? {}
       : {
@@ -345,14 +452,17 @@ function stateFromAuthority(
             sessionUid: authority.pendingReauthentication.sessionUid,
             expiresAt: authority.pendingReauthentication.expiresAt,
           },
-          pendingProofDigest:
-            authority.pendingReauthentication.proofDigest,
+          pendingBridgeFingerprint:
+            authority.pendingReauthentication.bridgeFingerprint,
           pendingAuthorizationEpoch:
             authority.pendingReauthentication.authorizationEpoch,
         }),
     ...(authority.consumedProofDigest === undefined
       ? {}
       : { consumedProofDigest: authority.consumedProofDigest }),
+    ...(authority.cleanupReturnTo === undefined
+      ? {}
+      : { cleanupReturnTo: authority.cleanupReturnTo }),
     ...(authority.evidence === undefined
       ? {}
       : { quarantineEvidence: authority.evidence }),
@@ -399,6 +509,97 @@ export class ConsentAuthorizationCodec {
   ) {
     if (expectedResource === "") {
       throw new Error("invalid consent resource");
+    }
+  }
+
+  async issueReauthenticationBridge(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    claims: ReauthenticationBridgeClaims,
+  ): Promise<ReauthenticationBridge> {
+    if (
+      !validAccountId(accountId) ||
+      clientId === "" ||
+      resource !== this.expectedResource ||
+      !proofPattern.test(claims.proof) ||
+      claims.authorizationEpoch === "" ||
+      !Number.isSafeInteger(claims.expiresAt) ||
+      claims.expiresAt < 1
+    ) {
+      throw new Error("invalid reauthentication bridge");
+    }
+    const binding: ReauthenticationBridgeBindingV1 = {
+      version: 1,
+      accountId,
+      clientId,
+      resource,
+      proof: claims.proof,
+      authorizationEpoch: claims.authorizationEpoch,
+      expiresAt: claims.expiresAt,
+    };
+    const bindingEnvelope = await this.vault.seal(
+      reauthenticationBridgeRecordType(clientId),
+      accountId,
+      Buffer.from(JSON.stringify(binding), "utf8"),
+    );
+    return {
+      ...claims,
+      bindingEnvelope,
+    };
+  }
+
+  async verifyReauthenticationBridge(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    bridge: ReauthenticationBridge,
+  ): Promise<VerifiedReauthenticationBridge> {
+    try {
+      if (
+        !validAccountId(accountId) ||
+        clientId === "" ||
+        resource !== this.expectedResource ||
+        !validReauthenticationBridge(bridge)
+      ) {
+        throw new Error("invalid bridge");
+      }
+      const plaintext = await this.vault.open(
+        reauthenticationBridgeRecordType(clientId),
+        accountId,
+        bridge.bindingEnvelope,
+      );
+      const parsed: unknown = JSON.parse(
+        Buffer.from(plaintext).toString("utf8"),
+      );
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error("invalid bridge");
+      }
+      const binding = parsed as Record<string, unknown>;
+      if (
+        binding.version !== 1 ||
+        binding.accountId !== accountId ||
+        binding.clientId !== clientId ||
+        binding.resource !== resource ||
+        binding.proof !== bridge.proof ||
+        binding.authorizationEpoch !== bridge.authorizationEpoch ||
+        binding.expiresAt !== bridge.expiresAt
+      ) {
+        throw new Error("invalid bridge");
+      }
+      return {
+        fingerprint: createHash("sha256")
+          .update(bridge.bindingEnvelope, "utf8")
+          .digest("base64url"),
+        authorizationEpoch: bridge.authorizationEpoch,
+        expiresAt: bridge.expiresAt,
+      };
+    } catch {
+      throw new Error("invalid reauthentication bridge");
     }
   }
 
@@ -513,6 +714,26 @@ export class ConsentAuthorizationCodec {
     }
     const resource = this.expectedResource;
     const scopes = normalizeScopes(state.scopes) ?? [];
+    const retiredReauthenticationBridges =
+      parseRetiredReauthenticationBridges(
+        state.retiredReauthenticationBridges,
+      );
+    if (
+      retiredReauthenticationBridges === null ||
+      (state.lifecycle === "pending_reauth" &&
+        parsePending(pending) === undefined) ||
+      (state.lifecycle !== "pending_reauth" && pending !== undefined) ||
+      (
+        state.lifecycle === "cleanup_finalizing" &&
+        (state.cleanupReturnTo === undefined || state.cleanupReturnTo === "")
+      ) ||
+      (
+        state.lifecycle !== "cleanup_finalizing" &&
+        state.cleanupReturnTo !== undefined
+      )
+    ) {
+      throw new Error("invalid consent authority state");
+    }
     const authority: ConsentAuthorityV2 = {
       version: 2,
       lifecycle: state.lifecycle,
@@ -522,9 +743,15 @@ export class ConsentAuthorizationCodec {
       ...(state.grantId === undefined ? {} : { grantId: state.grantId }),
       sessionIds: [...new Set(state.sessionIds)],
       ...(pending === undefined ? {} : { pendingReauthentication: pending }),
+      ...(retiredReauthenticationBridges.length === 0
+        ? {}
+        : { retiredReauthenticationBridges }),
       ...(consumedProofDigest === undefined
         ? {}
         : { consumedProofDigest }),
+      ...(state.cleanupReturnTo === undefined
+        ? {}
+        : { cleanupReturnTo: state.cleanupReturnTo }),
       ...(evidence === undefined ? {} : { evidence }),
     };
     const authorityEnvelope = await this.vault.seal(

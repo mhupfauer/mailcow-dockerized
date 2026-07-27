@@ -38,6 +38,7 @@ const csrfCookieName = "mailcow_mcp_interaction_csrf";
 const csrfLifetimeSeconds = 600;
 const maximumFormBytes = 16 * 1_024;
 const defaultMaximumConsentSessions = 32;
+const defaultMaximumRetiredReauthenticationBridges = 128;
 const allowedScopeSet = new Set<string>(MCP_OAUTH_SCOPES);
 
 interface InteractionDependencies {
@@ -53,6 +54,7 @@ interface InteractionDependencies {
   maximumInFlightInteractions?: number;
   maximumLoginQuotaEntries?: number;
   maximumConsentSessions?: number;
+  maximumRetiredReauthenticationBridges?: number;
   verificationTimeoutMs?: number;
   pendingReauthenticationTtlMs?: number;
   authorityMutations: AuthorizationMutationCoordinator;
@@ -534,15 +536,19 @@ function reauthenticationBridge(
   const proof = record.reauthenticationProof;
   const authorizationEpoch = record.authorizationEpoch;
   const expiresAt = record.reauthenticationExpiresAt;
+  const bindingEnvelope = record.reauthenticationBinding;
   return typeof proof === "string" &&
     proof !== "" &&
     typeof authorizationEpoch === "string" &&
     authorizationEpoch !== "" &&
-    Number.isSafeInteger(expiresAt)
+    Number.isSafeInteger(expiresAt) &&
+    typeof bindingEnvelope === "string" &&
+    bindingEnvelope !== ""
     ? {
         proof,
         authorizationEpoch,
         expiresAt: expiresAt as number,
+        bindingEnvelope,
       }
     : undefined;
 }
@@ -670,6 +676,26 @@ async function quarantineUnsafeAuthority(
   );
 }
 
+async function finalizeStrandedCleanup(
+  dependencies: InteractionDependencies,
+  consentRepository: MariaDbConsentAuthorizationRepository,
+  accountId: string,
+  clientId: string,
+  state: ConsentAuthorizationState,
+  currentGrantId: string | undefined,
+  currentSessionId: string,
+): Promise<void> {
+  await revokeProviderAuthorityBestEffort(
+    dependencies.provider,
+    [
+      ...(state.grantId === undefined ? [] : [state.grantId]),
+      ...(currentGrantId === undefined ? [] : [currentGrantId]),
+    ],
+    [...state.sessionIds, currentSessionId],
+  );
+  await consentRepository.completeClientCleanup(accountId, clientId);
+}
+
 async function finishRevocation(
   request: Request,
   response: Response,
@@ -683,6 +709,7 @@ async function finishRevocation(
   const cleanup = await consentRepository.beginClientCleanup(
     accountId,
     clientId,
+    currentSessionId,
   );
   if (cleanup?.lifecycle === "quarantined") {
     await revokeProviderAuthorityBestEffort(
@@ -705,17 +732,47 @@ async function finishRevocation(
       (sessionId) => sessionId !== currentSessionId,
     ),
   );
-  const returnTo = await dependencies.provider.interactionResult(
-    request,
-    response,
-    {
-      error: "access_denied",
-      error_description: "Mailbox access was revoked",
-    },
-    { mergeWithLastSubmission: false },
-  );
+  let finalizing = cleanup;
+  let returnTo = cleanup?.cleanupReturnTo;
+  if (returnTo === undefined) {
+    returnTo = await dependencies.provider.interactionResult(
+      request,
+      response,
+      {
+        error: "access_denied",
+        error_description: "Mailbox access was revoked",
+      },
+      { mergeWithLastSubmission: false },
+    );
+    const interaction = request.params.interaction;
+    if (
+      typeof interaction !== "string" ||
+      !safeReturnTo(returnTo, interaction, dependencies.issuer)
+    ) {
+      throw new Error("invalid provider interaction result");
+    }
+    if (cleanup?.lifecycle === "cleanup_pending") {
+      finalizing =
+        await consentRepository.stageClientCleanupFinalization(
+          accountId,
+          clientId,
+          returnTo,
+        );
+    }
+  } else {
+    const interaction = request.params.interaction;
+    if (
+      typeof interaction !== "string" ||
+      !safeReturnTo(returnTo, interaction, dependencies.issuer)
+    ) {
+      throw new Error("invalid retained provider interaction result");
+    }
+  }
   await revokeProviderAuthority(dependencies.provider, [], [currentSessionId]);
-  if (cleanup?.lifecycle === "cleanup_pending") {
+  if (
+    finalizing?.lifecycle === "cleanup_pending" ||
+    finalizing?.lifecycle === "cleanup_finalizing"
+  ) {
     await consentRepository.completeClientCleanup(accountId, clientId);
   }
   response.statusCode = 303;
@@ -747,6 +804,9 @@ export function createInteractionRouter(
   const verificationTimeoutMs = dependencies.verificationTimeoutMs ?? 15_000;
   const maximumConsentSessions =
     dependencies.maximumConsentSessions ?? defaultMaximumConsentSessions;
+  const maximumRetiredReauthenticationBridges =
+    dependencies.maximumRetiredReauthenticationBridges ??
+    defaultMaximumRetiredReauthenticationBridges;
   const pendingReauthenticationTtlMs =
     dependencies.pendingReauthenticationTtlMs ?? 10 * 60 * 1_000;
   if (
@@ -762,6 +822,9 @@ export function createInteractionRouter(
     verificationTimeoutMs < 1 ||
     !Number.isSafeInteger(maximumConsentSessions) ||
     maximumConsentSessions < 1 ||
+    !Number.isSafeInteger(maximumRetiredReauthenticationBridges) ||
+    maximumRetiredReauthenticationBridges < 1 ||
+    maximumRetiredReauthenticationBridges > 1_024 ||
     !Number.isSafeInteger(pendingReauthenticationTtlMs) ||
     pendingReauthenticationTtlMs < 1
   ) {
@@ -783,6 +846,10 @@ export function createInteractionRouter(
     dependencies.pool,
     new AesGcmCredentialVault(dependencies.encryptionKey),
     dependencies.resource.href,
+    {
+      maximumSessions: maximumConsentSessions,
+      maximumRetiredReauthenticationBridges,
+    },
   );
 
   const precheckIp: RequestHandler = (request, response, next) => {
@@ -891,6 +958,19 @@ export function createInteractionRouter(
             consentRepository,
             accountId,
             clientId,
+            details.grantId,
+            sessionId,
+          );
+          reject(response, 401, "Reconnect mailbox access.");
+          return;
+        }
+        if (storedState?.lifecycle === "cleanup_finalizing") {
+          await finalizeStrandedCleanup(
+            dependencies,
+            consentRepository,
+            accountId,
+            clientId,
+            storedState,
             details.grantId,
             sessionId,
           );
@@ -1062,15 +1142,27 @@ export function createInteractionRouter(
                 );
             const proof = randomBytes(32).toString("base64url");
             const expiresAt = now() + pendingReauthenticationTtlMs;
+            const bridge =
+              await consentRepository.issueReauthenticationBridge(
+                verified.accountId,
+                clientId,
+                dependencies.resource.href,
+                {
+                  proof,
+                  authorizationEpoch: verified.authorizationEpoch,
+                  expiresAt,
+                },
+              );
             await dependencies.provider.interactionFinished(
               request,
               response,
               {
                 login: {
                   accountId: verified.accountId,
-                  reauthenticationProof: proof,
-                  authorizationEpoch: verified.authorizationEpoch,
-                  reauthenticationExpiresAt: expiresAt,
+                  reauthenticationProof: bridge.proof,
+                  authorizationEpoch: bridge.authorizationEpoch,
+                  reauthenticationExpiresAt: bridge.expiresAt,
+                  reauthenticationBinding: bridge.bindingEnvelope,
                 },
               } as InteractionResults,
               { mergeWithLastSubmission: false },
@@ -1153,6 +1245,19 @@ export function createInteractionRouter(
               details.grantId,
               sessionId,
             );
+            return;
+          }
+          if (storedState?.lifecycle === "cleanup_finalizing") {
+            await finalizeStrandedCleanup(
+              dependencies,
+              consentRepository,
+              accountId,
+              clientId,
+              storedState,
+              details.grantId,
+              sessionId,
+            );
+            reject(response, 401, "Reconnect mailbox access.");
             return;
           }
           if (body.decision !== "approve") {

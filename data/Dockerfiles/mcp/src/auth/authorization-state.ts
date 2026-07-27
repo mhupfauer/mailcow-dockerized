@@ -9,15 +9,34 @@ import type {
 import { MariaDbAccountRepository } from "./account-repository.js";
 import {
   ConsentAuthorizationCodec,
-  reauthenticationProofDigest,
   validAccountId,
-  validReauthenticationBridge,
   type ConsentAuthorizationState,
   type ConsentSealOptions,
   type PendingReauthenticationAuthority,
   type ReauthenticationBridge,
+  type ReauthenticationBridgeClaims,
+  type RetiredReauthenticationBridge,
+  type VerifiedReauthenticationBridge,
 } from "./consent-authorization-codec.js";
 import type { CredentialVault } from "./crypto-vault.js";
+
+const defaultMaximumSessions = 32;
+const defaultMaximumRetiredReauthenticationBridges = 128;
+
+function compareRetiredBridges(
+  first: RetiredReauthenticationBridge,
+  second: RetiredReauthenticationBridge,
+): number {
+  const expiryOrder = first.expiresAt - second.expiresAt;
+  if (expiryOrder !== 0) {
+    return expiryOrder;
+  }
+  return first.fingerprint < second.fingerprint
+    ? -1
+    : first.fingerprint > second.fingerprint
+      ? 1
+      : 0;
+}
 
 interface ConsentRow extends RowDataPacket {
   clientId: string;
@@ -45,6 +64,17 @@ export class CleanupPendingAuthorizationError extends Error {
   constructor() {
     super("authorization cleanup is pending");
   }
+}
+
+export class ReauthenticationBridgeCapacityError extends Error {
+  constructor(message = "reauthentication bridge capacity is exhausted") {
+    super(message);
+  }
+}
+
+export interface ConsentAuthorizationRepositoryOptions {
+  maximumSessions?: number;
+  maximumRetiredReauthenticationBridges?: number;
 }
 
 export interface AccountAuthorizationGate {
@@ -112,14 +142,96 @@ export class BoundedAuthorizationMutationCoordinator implements AuthorizationMut
 export class MariaDbConsentAuthorizationRepository {
   private readonly accountRepository: MariaDbAccountRepository;
   private readonly codec: ConsentAuthorizationCodec;
+  private readonly maximumSessions: number;
+  private readonly maximumRetiredReauthenticationBridges: number;
 
   constructor(
     private readonly pool: Pool,
     vault: CredentialVault,
     expectedResource: string,
+    {
+      maximumSessions = defaultMaximumSessions,
+      maximumRetiredReauthenticationBridges =
+        defaultMaximumRetiredReauthenticationBridges,
+    }: ConsentAuthorizationRepositoryOptions = {},
   ) {
+    if (
+      !Number.isSafeInteger(maximumSessions) ||
+      maximumSessions < 1 ||
+      !Number.isSafeInteger(maximumRetiredReauthenticationBridges) ||
+      maximumRetiredReauthenticationBridges < 1 ||
+      maximumRetiredReauthenticationBridges > 1_024
+    ) {
+      throw new Error("invalid consent authorization limits");
+    }
     this.accountRepository = new MariaDbAccountRepository(pool, vault);
     this.codec = new ConsentAuthorizationCodec(vault, expectedResource);
+    this.maximumSessions = maximumSessions;
+    this.maximumRetiredReauthenticationBridges =
+      maximumRetiredReauthenticationBridges;
+  }
+
+  issueReauthenticationBridge(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    claims: ReauthenticationBridgeClaims,
+  ): Promise<ReauthenticationBridge> {
+    return this.codec.issueReauthenticationBridge(
+      accountId,
+      clientId,
+      resource,
+      claims,
+    );
+  }
+
+  private async verifiedBridge(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    bridge: ReauthenticationBridge,
+  ): Promise<VerifiedReauthenticationBridge> {
+    try {
+      return await this.codec.verifyReauthenticationBridge(
+        accountId,
+        clientId,
+        resource,
+        bridge,
+      );
+    } catch {
+      throw new InvalidReauthenticationProofError();
+    }
+  }
+
+  private liveRetiredBridges(
+    state: ConsentAuthorizationState | null,
+    now: number,
+  ): RetiredReauthenticationBridge[] {
+    return (state?.retiredReauthenticationBridges ?? [])
+      .filter((retired) => retired.expiresAt > now)
+      .sort(compareRetiredBridges);
+  }
+
+  private retireBridge(
+    retired: RetiredReauthenticationBridge[],
+    fingerprint: string,
+    expiresAt: number,
+    now: number,
+  ): RetiredReauthenticationBridge[] {
+    if (expiresAt <= now) {
+      return retired;
+    }
+    if (retired.some((entry) => entry.fingerprint === fingerprint)) {
+      return retired;
+    }
+    if (
+      retired.length >= this.maximumRetiredReauthenticationBridges
+    ) {
+      throw new ReauthenticationBridgeCapacityError();
+    }
+    return [...retired, { fingerprint, expiresAt }].sort(
+      compareRetiredBridges,
+    );
   }
 
   private async writeStateLocked(
@@ -222,11 +334,16 @@ export class MariaDbConsentAuthorizationRepository {
       !validAccountId(accountId) ||
       clientId === "" ||
       resource === "" ||
-      sessionUid === "" ||
-      !validReauthenticationBridge(bridge)
+      sessionUid === ""
     ) {
       throw new InvalidReauthenticationProofError();
     }
+    const verifiedBridge = await this.verifiedBridge(
+      accountId,
+      clientId,
+      resource,
+      bridge,
+    );
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -237,8 +354,8 @@ export class MariaDbConsentAuthorizationRepository {
         );
       if (
         account === null ||
-        account.authorizationEpoch !== bridge.authorizationEpoch ||
-        bridge.expiresAt <= now
+        account.authorizationEpoch !== verifiedBridge.authorizationEpoch ||
+        verifiedBridge.expiresAt <= now
       ) {
         throw new InvalidReauthenticationProofError();
       }
@@ -263,30 +380,72 @@ export class MariaDbConsentAuthorizationRepository {
       }
       if (
         existing?.lifecycle === "quarantined" ||
-        existing?.lifecycle === "cleanup_pending"
+        existing?.lifecycle === "cleanup_pending" ||
+        existing?.lifecycle === "cleanup_finalizing"
       ) {
         await connection.commit();
         return existing;
       }
-      const digest = reauthenticationProofDigest(
-        bridge,
-        accountId,
-        clientId,
-        resource,
-        sessionUid,
+      let retiredReauthenticationBridges = this.liveRetiredBridges(
+        existing,
+        now,
       );
       if (
-        existing?.lifecycle === "active" &&
-        existing.consumedProofDigest === digest
+        retiredReauthenticationBridges.some(
+          (retired) =>
+            retired.fingerprint === verifiedBridge.fingerprint,
+        )
       ) {
-        await connection.commit();
-        return existing;
+        throw new InvalidReauthenticationProofError();
+      }
+      const sessionIds = [...(existing?.sessionIds ?? [])];
+      if (existing?.lifecycle === "pending_reauth") {
+        if (
+          existing.pendingBridgeFingerprint ===
+          verifiedBridge.fingerprint
+        ) {
+          if (
+            existing.pendingReauthentication?.sessionUid !== sessionUid ||
+            existing.pendingAuthorizationEpoch !==
+              verifiedBridge.authorizationEpoch ||
+            existing.pendingReauthentication.expiresAt !==
+              verifiedBridge.expiresAt
+          ) {
+            throw new InvalidReauthenticationProofError();
+          }
+          await connection.commit();
+          return existing;
+        }
+        const displacedSessionUid =
+          existing.pendingReauthentication?.sessionUid;
+        if (
+          displacedSessionUid !== undefined &&
+          !sessionIds.includes(displacedSessionUid)
+        ) {
+          if (sessionIds.length >= this.maximumSessions) {
+            throw new ReauthenticationBridgeCapacityError(
+              "reauthentication session capacity is exhausted",
+            );
+          }
+          sessionIds.push(displacedSessionUid);
+        }
+        if (
+          existing.pendingBridgeFingerprint !== undefined &&
+          existing.pendingReauthentication !== undefined
+        ) {
+          retiredReauthenticationBridges = this.retireBridge(
+            retiredReauthenticationBridges,
+            existing.pendingBridgeFingerprint,
+            existing.pendingReauthentication.expiresAt,
+            now,
+          );
+        }
       }
       const pending: PendingReauthenticationAuthority = {
-        proofDigest: digest,
-        authorizationEpoch: bridge.authorizationEpoch,
+        bridgeFingerprint: verifiedBridge.fingerprint,
+        authorizationEpoch: verifiedBridge.authorizationEpoch,
         sessionUid,
-        expiresAt: bridge.expiresAt,
+        expiresAt: verifiedBridge.expiresAt,
       };
       const state: ConsentAuthorizationState = {
         lifecycle: "pending_reauth",
@@ -296,12 +455,13 @@ export class MariaDbConsentAuthorizationRepository {
         ...(existing?.grantId === undefined
           ? {}
           : { grantId: existing.grantId }),
-        sessionIds: existing?.sessionIds ?? [],
+        sessionIds,
         accountActive: !account.revoked,
         pendingReauthentication: {
           sessionUid,
-          expiresAt: bridge.expiresAt,
+          expiresAt: verifiedBridge.expiresAt,
         },
+        retiredReauthenticationBridges,
       };
       await this.writeStateLocked(connection, accountId, state, { pending });
       await connection.commit();
@@ -327,6 +487,12 @@ export class MariaDbConsentAuthorizationRepository {
       sessionIds: readonly string[];
     },
   ): Promise<void> {
+    const verifiedBridge = await this.verifiedBridge(
+      accountId,
+      clientId,
+      resource,
+      bridge,
+    );
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -337,8 +503,8 @@ export class MariaDbConsentAuthorizationRepository {
         );
       if (
         account === null ||
-        account.authorizationEpoch !== bridge.authorizationEpoch ||
-        bridge.expiresAt <= now
+        account.authorizationEpoch !== verifiedBridge.authorizationEpoch ||
+        verifiedBridge.expiresAt <= now
       ) {
         throw new InvalidReauthenticationProofError();
       }
@@ -348,37 +514,55 @@ export class MariaDbConsentAuthorizationRepository {
         clientId,
         !account.revoked,
       );
-      const digest = reauthenticationProofDigest(
-        bridge,
-        accountId,
-        clientId,
-        resource,
-        sessionUid,
-      );
       if (
         existing === null ||
         existing.needsQuarantine === true ||
         existing.lifecycle !== "pending_reauth" ||
-        existing.pendingProofDigest !== digest ||
-        existing.pendingAuthorizationEpoch !== bridge.authorizationEpoch ||
+        existing.pendingBridgeFingerprint !==
+          verifiedBridge.fingerprint ||
+        existing.pendingAuthorizationEpoch !==
+          verifiedBridge.authorizationEpoch ||
         existing.pendingReauthentication?.sessionUid !== sessionUid ||
-        existing.pendingReauthentication.expiresAt !== bridge.expiresAt
+        existing.pendingReauthentication.expiresAt !==
+          verifiedBridge.expiresAt
       ) {
         throw new InvalidReauthenticationProofError();
       }
+      const sessionIds = [...new Set(state.sessionIds)];
+      if (sessionIds.length > this.maximumSessions) {
+        throw new ReauthenticationBridgeCapacityError(
+          "reauthentication session capacity is exhausted",
+        );
+      }
+      let retiredReauthenticationBridges = this.liveRetiredBridges(
+        existing,
+        now,
+      );
+      if (
+        retiredReauthenticationBridges.some(
+          (retired) =>
+            retired.fingerprint === verifiedBridge.fingerprint,
+        )
+      ) {
+        throw new InvalidReauthenticationProofError();
+      }
+      retiredReauthenticationBridges = this.retireBridge(
+        retiredReauthenticationBridges,
+        verifiedBridge.fingerprint,
+        verifiedBridge.expiresAt,
+        now,
+      );
       const active: ConsentAuthorizationState = {
         lifecycle: "active",
         clientId,
         resource,
         scopes: [...state.scopes],
         grantId: state.grantId,
-        sessionIds: [...state.sessionIds],
+        sessionIds,
         accountActive: true,
-        consumedProofDigest: digest,
+        retiredReauthenticationBridges,
       };
-      await this.writeStateLocked(connection, accountId, active, {
-        consumedProofDigest: digest,
-      });
+      await this.writeStateLocked(connection, accountId, active);
       if (account.revoked) {
         await connection.execute(
           `UPDATE accounts
@@ -430,6 +614,12 @@ export class MariaDbConsentAuthorizationRepository {
       ) {
         throw new InactiveAuthorizationAccountError();
       }
+      const sessionIds = [...new Set(state.sessionIds)];
+      if (sessionIds.length > this.maximumSessions) {
+        throw new ReauthenticationBridgeCapacityError(
+          "reauthentication session capacity is exhausted",
+        );
+      }
       await this.writeStateLocked(
         connection,
         accountId,
@@ -439,8 +629,14 @@ export class MariaDbConsentAuthorizationRepository {
           resource,
           scopes: [...state.scopes],
           grantId: state.grantId,
-          sessionIds: [...state.sessionIds],
+          sessionIds,
           accountActive: true,
+          ...(existing.retiredReauthenticationBridges === undefined
+            ? {}
+            : {
+                retiredReauthenticationBridges:
+                  existing.retiredReauthenticationBridges,
+              }),
           ...(existing.consumedProofDigest === undefined
             ? {}
             : { consumedProofDigest: existing.consumedProofDigest }),
@@ -513,6 +709,7 @@ export class MariaDbConsentAuthorizationRepository {
   async beginClientCleanup(
     accountId: string,
     clientId: string,
+    currentSessionUid?: string,
   ): Promise<ConsentAuthorizationState | null> {
     const connection = await this.pool.getConnection();
     try {
@@ -547,7 +744,8 @@ export class MariaDbConsentAuthorizationRepository {
       if (
         existing.lifecycle === "quarantined" ||
         existing.lifecycle === "revoked" ||
-        existing.lifecycle === "cleanup_pending"
+        existing.lifecycle === "cleanup_pending" ||
+        existing.lifecycle === "cleanup_finalizing"
       ) {
         await connection.commit();
         return existing;
@@ -561,6 +759,7 @@ export class MariaDbConsentAuthorizationRepository {
             ...(existing.pendingReauthentication === undefined
               ? []
               : [existing.pendingReauthentication.sessionUid]),
+            ...(currentSessionUid === undefined ? [] : [currentSessionUid]),
           ]),
         ],
         accountActive: existing.accountActive,
@@ -570,6 +769,67 @@ export class MariaDbConsentAuthorizationRepository {
       await this.writeStateLocked(connection, accountId, cleanupPending);
       await connection.commit();
       return cleanupPending;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async stageClientCleanupFinalization(
+    accountId: string,
+    clientId: string,
+    returnTo: string,
+  ): Promise<ConsentAuthorizationState | null> {
+    if (
+      !validAccountId(accountId) ||
+      clientId === "" ||
+      returnTo === "" ||
+      returnTo.length > 4_096
+    ) {
+      throw new CleanupPendingAuthorizationError();
+    }
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      if (!(await this.lockAccountRow(connection, accountId))) {
+        await connection.commit();
+        return null;
+      }
+      const existing = await this.lockConsent(
+        connection,
+        accountId,
+        clientId,
+        false,
+      );
+      if (existing === null || existing.lifecycle === "revoked") {
+        await connection.commit();
+        return existing;
+      }
+      if (
+        existing.lifecycle === "cleanup_finalizing" &&
+        existing.cleanupReturnTo === returnTo
+      ) {
+        await connection.commit();
+        return existing;
+      }
+      if (
+        existing.needsQuarantine === true ||
+        existing.lifecycle !== "cleanup_pending"
+      ) {
+        throw new CleanupPendingAuthorizationError();
+      }
+      const finalizing: ConsentAuthorizationState = {
+        ...existing,
+        lifecycle: "cleanup_finalizing",
+        cleanupReturnTo: returnTo,
+        pendingReauthentication: undefined,
+        consumedProofDigest: undefined,
+      };
+      await this.writeStateLocked(connection, accountId, finalizing);
+      await connection.commit();
+      return finalizing;
     } catch (error) {
       await connection.rollback();
       throw error;
@@ -601,7 +861,10 @@ export class MariaDbConsentAuthorizationRepository {
       }
       if (
         existing.needsQuarantine === true ||
-        existing.lifecycle !== "cleanup_pending"
+        (
+          existing.lifecycle !== "cleanup_pending" &&
+          existing.lifecycle !== "cleanup_finalizing"
+        )
       ) {
         throw new CleanupPendingAuthorizationError();
       }
@@ -612,6 +875,8 @@ export class MariaDbConsentAuthorizationRepository {
         scopes: existing.scopes,
         sessionIds: [],
         accountActive: existing.accountActive,
+        retiredReauthenticationBridges:
+          existing.retiredReauthenticationBridges ?? [],
       });
       await connection.commit();
     } catch (error) {
@@ -666,7 +931,8 @@ export class MariaDbConsentAuthorizationRepository {
         }
         if (
           existing.lifecycle === "quarantined" ||
-          existing.lifecycle === "revoked"
+          existing.lifecycle === "revoked" ||
+          existing.lifecycle === "cleanup_finalizing"
         ) {
           prepared.push({ ...existing, accountActive: false });
           continue;
