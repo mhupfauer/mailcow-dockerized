@@ -681,17 +681,26 @@ async function finalizeStrandedCleanup(
   consentRepository: MariaDbConsentAuthorizationRepository,
   accountId: string,
   clientId: string,
-  state: ConsentAuthorizationState,
   currentGrantId: string | undefined,
   currentSessionId: string,
+  bridge: ReauthenticationBridge | undefined,
+  now: number,
 ): Promise<void> {
+  const retained = await consentRepository.retainCleanupFinalizer(
+    accountId,
+    clientId,
+    dependencies.resource.href,
+    currentSessionId,
+    bridge,
+    now,
+  );
   await revokeProviderAuthorityBestEffort(
     dependencies.provider,
     [
-      ...(state.grantId === undefined ? [] : [state.grantId]),
+      ...(retained.grantId === undefined ? [] : [retained.grantId]),
       ...(currentGrantId === undefined ? [] : [currentGrantId]),
     ],
-    [...state.sessionIds, currentSessionId],
+    retained.sessionIds,
   );
   await consentRepository.completeClientCleanup(accountId, clientId);
 }
@@ -970,9 +979,10 @@ export function createInteractionRouter(
             consentRepository,
             accountId,
             clientId,
-            storedState,
             details.grantId,
             sessionId,
+            bridge,
+            now(),
           );
           reject(response, 401, "Reconnect mailbox access.");
           return;
@@ -1253,9 +1263,10 @@ export function createInteractionRouter(
               consentRepository,
               accountId,
               clientId,
-              storedState,
               details.grantId,
               sessionId,
+              bridge,
+              now(),
             );
             reject(response, 401, "Reconnect mailbox access.");
             return;

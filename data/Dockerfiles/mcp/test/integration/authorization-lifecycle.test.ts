@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import type { RowDataPacket } from "mysql2/promise";
@@ -525,6 +526,171 @@ describe("mailcow authorization lifecycle", () => {
         103,
       ),
     ).rejects.toThrow("reauthentication proof is invalid");
+  });
+
+  test("cleanup finalizer retention is idempotent and fails closed on rebound or capacity", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "cleanup-finalizer-repository@example.test",
+      "app-password",
+    );
+    const clientId = "cleanup-finalizer-repository-client";
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+      { maximumSessions: 2 },
+    );
+    const activationBridge =
+      await consentRepository.issueReauthenticationBridge(
+        verified.accountId,
+        clientId,
+        resource.href,
+        {
+          proof: "d".repeat(43),
+          authorizationEpoch: verified.authorizationEpoch,
+          expiresAt: 200,
+        },
+      );
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "existing-session",
+      activationBridge,
+      100,
+    );
+    await consentRepository.activatePending(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "existing-session",
+      activationBridge,
+      100,
+      {
+        scopes: ["mail.read"],
+        grantId: "cleanup-finalizer-grant",
+        sessionIds: ["existing-session"],
+      },
+    );
+    await consentRepository.beginClientCleanup(
+      verified.accountId,
+      clientId,
+      undefined,
+      101,
+    );
+    await consentRepository.stageClientCleanupFinalization(
+      verified.accountId,
+      clientId,
+      new URL("/oauth/auth/cleanup-finalizer-result", issuer).href,
+    );
+    const bridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "e".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+
+    const retained = await consentRepository.retainCleanupFinalizer(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "fresh-session-one",
+      bridge,
+      102,
+    );
+    const repeated = await consentRepository.retainCleanupFinalizer(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "fresh-session-one",
+      bridge,
+      102,
+    );
+
+    expect(repeated).toEqual(retained);
+    expect(repeated.sessionIds).toEqual([
+      "existing-session",
+      "fresh-session-one",
+    ]);
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "fresh-session-two",
+        bridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "fresh-session-two",
+        undefined,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        "wrong-client",
+        resource.href,
+        "fresh-session-two",
+        bridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        clientId,
+        "https://other.example.test/mcp",
+        "fresh-session-two",
+        bridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    const capacityBridge =
+      await consentRepository.issueReauthenticationBridge(
+        verified.accountId,
+        clientId,
+        resource.href,
+        {
+          proof: "f".repeat(43),
+          authorizationEpoch: verified.authorizationEpoch,
+          expiresAt: 200,
+        },
+      );
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "fresh-session-two",
+        capacityBridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication session capacity is exhausted");
+    expect(
+      await consentRepository.getStored(verified.accountId, clientId),
+    ).toEqual(retained);
+    const raw = await rawConsent(verified.accountId, clientId);
+    expect(raw).not.toContain("fresh-session-one");
+    expect(raw).not.toContain("fresh-session-two");
+    expect(raw).not.toContain(
+      createHash("sha256")
+        .update(capacityBridge.bindingEnvelope, "utf8")
+        .digest("base64url"),
+    );
+    for (const retired of retained.retiredReauthenticationBridges ?? []) {
+      expect(raw).not.toContain(retired.fingerprint);
+    }
   });
 
   test("retires an unactivated bridge when client cleanup begins", async () => {
@@ -1354,6 +1520,263 @@ describe("mailcow authorization lifecycle", () => {
       decision: "approve",
     });
     expect(reapproved.status).toBe(303);
+  });
+
+  test("retains a fresh cleanup finalizer Session before provider cleanup", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const active = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(active?.sessionIds).toHaveLength(1);
+    await consentRepository.beginClientCleanup(
+      accountId as string,
+      clientId,
+      active?.sessionIds[0],
+    );
+    await consentRepository.stageClientCleanupFinalization(
+      accountId as string,
+      clientId,
+      new URL("/oauth/auth/retained-provider-result", issuer).href,
+    );
+    for (const sessionId of active?.sessionIds ?? []) {
+      const session = await provider.Session.findByUid(sessionId);
+      await session?.destroy();
+    }
+
+    const finalizerClient = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const finalizerLogin = await loginPageFor(finalizerClient, clientId);
+    const finalizerLoggedIn = await finalizerClient.postForm(
+      finalizerLogin.path,
+      {
+        csrf: hidden(finalizerLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      },
+    );
+    const finalizerResume = await finalizerClient.get(
+      locationPath(finalizerLoggedIn),
+    );
+    const finalizerPath = locationPath(finalizerResume);
+    const originalFindSession = provider.Session.findByUid.bind(
+      provider.Session,
+    );
+    let freshSessionUid: string | undefined;
+    let freshSessionLookups = 0;
+    const findSession = vi
+      .spyOn(provider.Session, "findByUid")
+      .mockImplementation(async (sessionUid) => {
+        const session = await originalFindSession(sessionUid);
+        if (session !== undefined) {
+          freshSessionUid ??= sessionUid;
+          if (sessionUid === freshSessionUid) {
+            freshSessionLookups += 1;
+            if (freshSessionLookups === 2) {
+              throw new Error("session adapter unavailable");
+            }
+          }
+        }
+        return session;
+      });
+
+    const unavailable = await finalizerClient.get(finalizerPath);
+    findSession.mockRestore();
+
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers["cache-control"]).toContain("no-store");
+    expect(freshSessionUid).toBeTypeOf("string");
+    const retained = await consentRepository.getStored(
+      accountId as string,
+      clientId,
+    );
+    expect(retained).toMatchObject({ lifecycle: "cleanup_finalizing" });
+    expect(retained?.sessionIds).toContain(freshSessionUid);
+    expect(
+      await provider.Session.findByUid(freshSessionUid as string),
+    ).toBeDefined();
+    expect(await rawConsent(accountId as string, clientId)).not.toContain(
+      freshSessionUid as string,
+    );
+
+    const retryClient = new HttpClient((server.address() as AddressInfo).port);
+    const retryLogin = await loginPageFor(retryClient, clientId);
+    const retryLoggedIn = await retryClient.postForm(retryLogin.path, {
+      csrf: hidden(retryLogin.response.body, "csrf"),
+      mailbox: "user@example.test",
+      app_password: "app-password",
+    });
+    const retryResume = await retryClient.get(locationPath(retryLoggedIn));
+    const retried = await retryClient.get(locationPath(retryResume));
+
+    expect(retried.status).toBe(401);
+    for (const sessionId of retained?.sessionIds ?? []) {
+      expect(await provider.Session.findByUid(sessionId)).toBeUndefined();
+    }
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "revoked",
+      sessionIds: [],
+    });
+  });
+
+  test("account-wide retry preserves and later destroys a retained fresh cleanup finalizer Session", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    const callback = await client.get(locationPath(approved));
+    const code = new URL(
+      callback.headers.location as string,
+    ).searchParams.get("code");
+    const authorizationCode = await provider.AuthorizationCode.find(
+      code as string,
+    );
+    const accountId = authorizationCode?.accountId;
+    expect(accountId).toBeTypeOf("string");
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const active = await consentRepository.getActive(
+      accountId as string,
+      clientId,
+    );
+    expect(active?.sessionIds).toHaveLength(1);
+    await consentRepository.beginClientCleanup(
+      accountId as string,
+      clientId,
+      active?.sessionIds[0],
+    );
+    await consentRepository.stageClientCleanupFinalization(
+      accountId as string,
+      clientId,
+      new URL("/oauth/auth/account-cleanup-finalizer-result", issuer).href,
+    );
+    for (const sessionId of active?.sessionIds ?? []) {
+      const session = await provider.Session.findByUid(sessionId);
+      await session?.destroy();
+    }
+
+    const finalizerClient = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const finalizerLogin = await loginPageFor(finalizerClient, clientId);
+    const finalizerLoggedIn = await finalizerClient.postForm(
+      finalizerLogin.path,
+      {
+        csrf: hidden(finalizerLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "app-password",
+      },
+    );
+    const finalizerResume = await finalizerClient.get(
+      locationPath(finalizerLoggedIn),
+    );
+    const finalizerPath = locationPath(finalizerResume);
+    const originalFindSession = provider.Session.findByUid.bind(
+      provider.Session,
+    );
+    let freshSessionUid: string | undefined;
+    let freshSessionLookups = 0;
+    const findSession = vi
+      .spyOn(provider.Session, "findByUid")
+      .mockImplementation(async (sessionUid) => {
+        const session = await originalFindSession(sessionUid);
+        if (session !== undefined) {
+          freshSessionUid ??= sessionUid;
+          if (sessionUid === freshSessionUid) {
+            freshSessionLookups += 1;
+            if (freshSessionLookups === 2) {
+              throw new Error("session adapter unavailable");
+            }
+          }
+        }
+        return session;
+      });
+    const unavailable = await finalizerClient.get(finalizerPath);
+    findSession.mockRestore();
+
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers["cache-control"]).toContain("no-store");
+    expect(freshSessionUid).toBeTypeOf("string");
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "cleanup_finalizing",
+      sessionIds: expect.arrayContaining([freshSessionUid]),
+    });
+    const accountRevoker = new MariaDbAccountAuthorizationRevoker(
+      consentRepository,
+      provider,
+      authorityMutations,
+      resource.href,
+    );
+    const failAccountCleanup = vi
+      .spyOn(provider.Session, "findByUid")
+      .mockImplementation(async (sessionUid) => {
+        if (sessionUid === freshSessionUid) {
+          throw new Error("session adapter unavailable");
+        }
+        return originalFindSession(sessionUid);
+      });
+
+    await expect(
+      accountRevoker.revokeCredential(accountId as string),
+    ).rejects.toThrow("unable to revoke account authorization");
+    failAccountCleanup.mockRestore();
+    expect(
+      await provider.Session.findByUid(freshSessionUid as string),
+    ).toBeDefined();
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "cleanup_finalizing",
+      sessionIds: expect.arrayContaining([freshSessionUid]),
+      accountActive: false,
+    });
+
+    await expect(
+      accountRevoker.revokeCredential(accountId as string),
+    ).resolves.toBeUndefined();
+    expect(
+      await provider.Session.findByUid(freshSessionUid as string),
+    ).toBeUndefined();
+    expect(
+      await consentRepository.getStored(accountId as string, clientId),
+    ).toMatchObject({
+      lifecycle: "revoked",
+      sessionIds: [],
+      accountActive: false,
+    });
   });
 
   test("account-wide revocation completes a retained finalization outbox without a provider Session", async () => {

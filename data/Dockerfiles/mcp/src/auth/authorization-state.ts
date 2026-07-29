@@ -864,6 +864,114 @@ export class MariaDbConsentAuthorizationRepository {
     }
   }
 
+  async retainCleanupFinalizer(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    currentSessionUid: string,
+    bridge: ReauthenticationBridge | undefined,
+    now: number,
+  ): Promise<ConsentAuthorizationState> {
+    if (
+      !validAccountId(accountId) ||
+      clientId === "" ||
+      resource === "" ||
+      currentSessionUid === ""
+    ) {
+      throw new InvalidReauthenticationProofError();
+    }
+    const verified =
+      bridge === undefined
+        ? undefined
+        : await this.verifiedBridge(
+            accountId,
+            clientId,
+            resource,
+            bridge,
+          );
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const account =
+        await this.accountRepository.getAuthorizationEpochLocked(
+          connection,
+          accountId,
+        );
+      if (account === null) {
+        throw new InvalidReauthenticationProofError();
+      }
+      const existing = await this.lockConsent(
+        connection,
+        accountId,
+        clientId,
+        !account.revoked,
+      );
+      if (
+        existing === null ||
+        existing.needsQuarantine === true ||
+        (
+          existing.lifecycle !== "cleanup_pending" &&
+          existing.lifecycle !== "cleanup_finalizing"
+        )
+      ) {
+        throw new InvalidReauthenticationProofError();
+      }
+      let retiredReauthenticationBridges = this.liveRetiredBridges(
+        existing,
+        now,
+      );
+      const alreadyRetired =
+        verified !== undefined &&
+        retiredReauthenticationBridges.some(
+          (entry) => entry.fingerprint === verified.fingerprint,
+        );
+      const alreadyRetained =
+        existing.sessionIds.includes(currentSessionUid);
+
+      if (alreadyRetired && !alreadyRetained) {
+        throw new InvalidReauthenticationProofError();
+      }
+      if (!alreadyRetained && verified === undefined) {
+        throw new InvalidReauthenticationProofError();
+      }
+      if (verified !== undefined && !alreadyRetired) {
+        if (
+          verified.authorizationEpoch !== account.authorizationEpoch ||
+          verified.expiresAt <= now
+        ) {
+          throw new InvalidReauthenticationProofError();
+        }
+        retiredReauthenticationBridges = this.retireBridge(
+          retiredReauthenticationBridges,
+          verified.fingerprint,
+          verified.expiresAt,
+          now,
+        );
+      }
+      const sessionIds = alreadyRetained
+        ? existing.sessionIds
+        : [...existing.sessionIds, currentSessionUid];
+      if (sessionIds.length > this.maximumSessions) {
+        throw new ReauthenticationBridgeCapacityError(
+          "reauthentication session capacity is exhausted",
+        );
+      }
+      const retained: ConsentAuthorizationState = {
+        ...existing,
+        sessionIds,
+        retiredReauthenticationBridges,
+      };
+      await this.writeStateLocked(connection, accountId, retained);
+      await connection.commit();
+      return retained;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
   async completeClientCleanup(
     accountId: string,
     clientId: string,
