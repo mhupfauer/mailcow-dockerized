@@ -1,6 +1,8 @@
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { describe, expect, test } from "vitest";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { describe, expect, test, vi } from "vitest";
 
 import {
   app,
@@ -34,6 +36,17 @@ function initializeRequest(): Record<string, unknown> {
       clientInfo: { name: "mcp-auth-test", version: "1.0.0" },
     },
   };
+}
+
+function deferred(): {
+  promise: Promise<void>;
+  resolve(): void;
+} {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 async function issueAccessToken(
@@ -112,6 +125,43 @@ async function mcpPost(
   headers: Record<string, string> = {},
 ) {
   return mcpRequest("POST", bearer, body, headers);
+}
+
+async function openAuthenticatedMcpGet(
+  bearer: string,
+  sessionId: string,
+): Promise<{
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+}> {
+  const port = (server.address() as AddressInfo).port;
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/mcp",
+        method: "GET",
+        headers: {
+          accept: "text/event-stream",
+          authorization: `Bearer ${bearer}`,
+          host: issuer.host,
+          "mcp-protocol-version": protocolVersion,
+          "mcp-session-id": sessionId,
+          "x-forwarded-proto": "https",
+        },
+      },
+      (response) => {
+        resolve({
+          status: response.statusCode ?? 0,
+          headers: response.headers,
+        });
+        response.destroy();
+      },
+    );
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 async function mintAccessToken(
@@ -198,6 +248,24 @@ describe("protected MCP Streamable HTTP", () => {
       );
     },
   );
+
+  test("dispatches authenticated GET for a live session", async () => {
+    const issued = await issueAccessToken(client, "mail.read");
+    const initialized = await mcpPost(
+      issued.accessToken,
+      initializeRequest(),
+    );
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    const response = await openAuthenticatedMcpGet(
+      issued.accessToken,
+      sessionId,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.headers["mcp-session-id"]).toBe(sessionId);
+  });
 
   test("rejects an expired opaque bearer token", async () => {
     const issued = await issueAccessToken(client, "mail.read");
@@ -329,6 +397,61 @@ describe("protected MCP Streamable HTTP", () => {
       },
     );
     expect(response.status).toBe(404);
+  });
+
+  test("shutdown waits for an in-flight initialize and closes its session", async () => {
+    const issued = await issueAccessToken(client, "mail.read");
+    const entered = deferred();
+    const release = deferred();
+    const realHandle =
+      StreamableHTTPServerTransport.prototype.handleRequest;
+    let blockFirstInitialize = true;
+    const gate = vi
+      .spyOn(StreamableHTTPServerTransport.prototype, "handleRequest")
+      .mockImplementation(async function (request, response, body) {
+        if (
+          blockFirstInitialize &&
+          typeof body === "object" &&
+          body !== null &&
+          (body as { method?: unknown }).method === "initialize"
+        ) {
+          blockFirstInitialize = false;
+          entered.resolve();
+          await release.promise;
+        }
+        return realHandle.call(this, request, response, body);
+      });
+
+    let closeResult: number | undefined;
+    let firstStatus = 0;
+    let afterClosingStatus = 0;
+    try {
+      const firstInitialize = mcpPost(
+        issued.accessToken,
+        initializeRequest(),
+      );
+      await entered.promise;
+      const closing = (
+        app as typeof app & { closeMcpSessions(): Promise<number> }
+      ).closeMcpSessions();
+      const afterClosing = await mcpPost(
+        issued.accessToken,
+        initializeRequest(),
+      );
+      afterClosingStatus = afterClosing.status;
+      release.resolve();
+      const initialized = await firstInitialize;
+      firstStatus = initialized.status;
+      closeResult = await closing;
+    } finally {
+      release.resolve();
+      gate.mockRestore();
+      await app.closeMcpSessions();
+    }
+
+    expect(firstStatus).toBe(200);
+    expect(afterClosingStatus).toBe(503);
+    expect(closeResult).toBe(1);
   });
 
   test("synchronously closes a session at its original token expiry", async () => {
@@ -497,6 +620,8 @@ describe("protected MCP Streamable HTTP", () => {
     expect(refreshed.status).toBe(200);
     const refreshedBody = refreshed.json() as Record<string, unknown>;
     expect(refreshedBody.access_token).toBeTypeOf("string");
+    expect(refreshedBody.refresh_token).toBeTypeOf("string");
+    expect(refreshedBody.refresh_token).not.toBe(issued.refreshToken);
     const refreshedModel = await provider.AccessToken.find(
       refreshedBody.access_token as string,
     );
@@ -508,5 +633,14 @@ describe("protected MCP Streamable HTTP", () => {
     );
     expect(initialized.status).toBe(200);
     expect(initialized.headers["mcp-session-id"]).toBeTypeOf("string");
+
+    const reused = await client.postForm("/oauth/token", {
+      grant_type: "refresh_token",
+      client_id: issued.clientId,
+      refresh_token: issued.refreshToken,
+      resource: resource.href,
+    });
+    expect(reused.status).toBe(400);
+    expect(reused.json()).toMatchObject({ error: "invalid_grant" });
   });
 });

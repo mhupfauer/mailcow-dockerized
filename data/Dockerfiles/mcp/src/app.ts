@@ -25,7 +25,7 @@ interface AppDependencies {
 }
 
 export interface MailcowMcpApp extends Express {
-  closeMcpSessions(): Promise<void>;
+  closeMcpSessions(): Promise<number>;
 }
 
 const registrationPath = "/oauth/reg";
@@ -33,7 +33,7 @@ const registrationWindowMs = 60 * 60 * 1_000;
 
 export function createApp(deps: AppDependencies): MailcowMcpApp {
   const app = express() as MailcowMcpApp;
-  app.closeMcpSessions = async () => {};
+  app.closeMcpSessions = async () => 0;
   app.set("trust proxy", 1);
 
   app.get("/health/live", (_request, response) => {

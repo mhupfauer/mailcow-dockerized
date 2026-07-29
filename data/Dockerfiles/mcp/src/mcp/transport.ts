@@ -31,7 +31,7 @@ interface McpTransportDependencies {
 export interface McpTransportController {
   authenticate: RequestHandler;
   handle: RequestHandler;
-  closeAllSessions(): Promise<void>;
+  closeAllSessions(): Promise<number>;
 }
 
 function isInitializeRequest(body: unknown): boolean {
@@ -49,16 +49,19 @@ export function createMcpTransportController({
   now = Date.now,
 }: McpTransportDependencies): McpTransportController {
   const sessions = new Map<string, Session>();
+  const initializationsInFlight = new Set<Promise<void>>();
+  let closing = false;
 
-  const closeSession = async (sessionId: string): Promise<void> => {
+  const closeSession = async (sessionId: string): Promise<boolean> => {
     const session = sessions.get(sessionId);
     if (session === undefined) {
-      return;
+      return false;
     }
     sessions.delete(sessionId);
     clearTimeout(session.inactivityTimer);
     clearTimeout(session.expiryTimer);
     await session.server.close();
+    return true;
   };
 
   const resetInactivity = (sessionId: string, session: Session): void => {
@@ -68,8 +71,22 @@ export function createMcpTransportController({
     }, sessionInactivityMs);
   };
 
-  const closeAllSessions = async (): Promise<void> => {
-    await Promise.all([...sessions.keys()].map(closeSession));
+  const closeAllSessions = async (): Promise<number> => {
+    closing = true;
+    let closed = 0;
+    const closeCurrentSessions = async (): Promise<void> => {
+      const results = await Promise.all(
+        [...sessions.keys()].map(closeSession),
+      );
+      closed += results.filter(Boolean).length;
+    };
+
+    await closeCurrentSessions();
+    while (initializationsInFlight.size > 0) {
+      await Promise.allSettled([...initializationsInFlight]);
+      await closeCurrentSessions();
+    }
+    return closed;
   };
 
   const authenticate = requireBearerAuth({
@@ -127,6 +144,10 @@ export function createMcpTransportController({
       response.status(400).json({ error: "invalid_request" });
       return;
     }
+    if (closing) {
+      response.status(503).json({ error: "server_shutting_down" });
+      return;
+    }
 
     const server = createMcpServer(account);
     let transport: StreamableHTTPServerTransport;
@@ -155,7 +176,9 @@ export function createMcpTransportController({
         };
         sessions.set(newSessionId, session);
       },
-      onsessionclosed: (closedSessionId) => closeSession(closedSessionId),
+      onsessionclosed: async (closedSessionId) => {
+        await closeSession(closedSessionId);
+      },
     });
     transport.onclose = () => {
       const activeSessionId = transport.sessionId;
@@ -169,8 +192,16 @@ export function createMcpTransportController({
       }
     };
 
-    await server.connect(transport);
-    await transport.handleRequest(request, response, request.body);
+    const initialization = (async () => {
+      await server.connect(transport);
+      await transport.handleRequest(request, response, request.body);
+    })();
+    initializationsInFlight.add(initialization);
+    try {
+      await initialization;
+    } finally {
+      initializationsInFlight.delete(initialization);
+    }
   };
 
   return { authenticate, handle, closeAllSessions };

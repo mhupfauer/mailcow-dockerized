@@ -58,6 +58,11 @@ function createClose(
   return () => {
     closing ??= (async () => {
       let closeError: Error | undefined;
+      const serverClosing = closeServer(server).then(
+        () => undefined,
+        (error: unknown) =>
+          error instanceof Error ? error : new Error("server close failed"),
+      );
       try {
         await app.closeMcpSessions();
       } catch (error) {
@@ -66,11 +71,9 @@ function createClose(
             ? error
             : new Error("MCP session close failed");
       }
-      try {
-        await closeServer(server);
-      } catch (error) {
-        closeError ??=
-          error instanceof Error ? error : new Error("server close failed");
+      const serverError = await serverClosing;
+      if (serverError !== undefined) {
+        closeError ??= serverError;
       }
       try {
         await pool.end();
