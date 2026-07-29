@@ -706,8 +706,8 @@ test_https_verification_supports_local_backend_mode() {
   case_dir="$(make_case strict-readiness)"
   run_mcp "${case_dir}" enable >/dev/null
   if grep '^curl ' "${case_dir}/calls.log" |
-    grep -Eq -- '--insecure|--connect-to'; then
-    fail "strict readiness weakened TLS or bypassed the public destination"
+    grep -Eq -- '--insecure|--connect-to|--noproxy'; then
+    fail "strict readiness changed TLS or connection routing"
   fi
 
   case_dir="$(make_case local-readiness-default-port)"
@@ -718,6 +718,8 @@ test_https_verification_supports_local_backend_mode() {
     fail "local readiness did not execute the complete contract"
   test "$(grep -c -- '--insecure' "${case_dir}/calls.log")" = 3 ||
     fail "local readiness did not allow the backend certificate on every request"
+  test "$(grep -Fc -- '--noproxy *' "${case_dir}/calls.log")" = 3 ||
+    fail "local readiness did not bypass inherited proxies on every request"
   test "$(grep -c -- \
     '--connect-to mail.example.test:443:127.0.0.1:443' \
     "${case_dir}/calls.log")" = 3 ||
@@ -729,6 +731,8 @@ test_https_verification_supports_local_backend_mode() {
   set_config_value "${case_dir}/mailcow.conf" MCP_ACTIVATION_LOCAL_VERIFY 1
   printf 'HTTPS_PORT=8443\n' >> "${case_dir}/mailcow.conf"
   run_mcp "${case_dir}" enable >/dev/null
+  test "$(grep -Fc -- '--noproxy *' "${case_dir}/calls.log")" = 3 ||
+    fail "custom-port local readiness did not bypass inherited proxies"
   test "$(grep -c -- \
     '--connect-to mail.example.test:443:127.0.0.1:8443' \
     "${case_dir}/calls.log")" = 3 ||

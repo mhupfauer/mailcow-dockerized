@@ -323,6 +323,7 @@ mcp_verify_https() {
       }
     fi
     curl_connection_options=(
+      --noproxy '*'
       --insecure
       --connect-to "${hostname}:443:127.0.0.1:${https_port}"
     )
