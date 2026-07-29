@@ -492,6 +492,8 @@ describe("mailcow authorization lifecycle", () => {
     await consentRepository.beginClientCleanup(
       verified.accountId,
       clientId,
+      undefined,
+      102,
     );
     await consentRepository.completeClientCleanup(
       verified.accountId,
@@ -523,6 +525,136 @@ describe("mailcow authorization lifecycle", () => {
         103,
       ),
     ).rejects.toThrow("reauthentication proof is invalid");
+  });
+
+  test("retires an unactivated bridge when client cleanup begins", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "cleanup-pending-bridge@example.test",
+      "app-password",
+    );
+    const clientId = "cleanup-pending-bridge-client";
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const bridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "a".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        interactionUid: "cleanup-pending-bridge",
+        expiresAt: 200,
+      },
+    );
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "pending-session",
+      bridge,
+      100,
+    );
+    const verifiedBridgeFingerprint = (
+      await consentRepository.getStored(verified.accountId, clientId)
+    )?.pendingBridgeFingerprint;
+    expect(verifiedBridgeFingerprint).toBeTypeOf("string");
+
+    await consentRepository.beginClientCleanup(
+      verified.accountId,
+      clientId,
+      "current-session",
+      101,
+    );
+    await consentRepository.completeClientCleanup(verified.accountId, clientId);
+
+    expect(
+      await consentRepository.getStored(verified.accountId, clientId),
+    ).toMatchObject({
+      lifecycle: "revoked",
+      sessionIds: [],
+      retiredReauthenticationBridges: [{ expiresAt: 200 }],
+    });
+    expect(await rawConsent(verified.accountId, clientId)).not.toContain(
+      verifiedBridgeFingerprint as string,
+    );
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "replayed-session",
+        bridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+  });
+
+  test("rolls back client cleanup when retiring a pending bridge exceeds capacity", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "cleanup-bridge-capacity@example.test",
+      "app-password",
+    );
+    const clientId = "cleanup-bridge-capacity-client";
+    const boundedRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+      { maximumRetiredReauthenticationBridges: 1 },
+    );
+    const firstBridge = await boundedRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "b".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    const pendingBridge = await boundedRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "c".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    await boundedRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "retired-session",
+      firstBridge,
+      100,
+    );
+    await boundedRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "pending-session",
+      pendingBridge,
+      100,
+    );
+
+    await expect(
+      boundedRepository.beginClientCleanup(
+        verified.accountId,
+        clientId,
+        undefined,
+        101,
+      ),
+    ).rejects.toThrow("reauthentication bridge capacity is exhausted");
+    expect(
+      await boundedRepository.getStored(verified.accountId, clientId),
+    ).toMatchObject({
+      lifecycle: "pending_reauth",
+      pendingReauthentication: { sessionUid: "pending-session" },
+    });
   });
 
   test("superseding an abandoned same-client reauthentication tracks both Sessions and rejects the old bridge", async () => {

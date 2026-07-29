@@ -710,6 +710,7 @@ export class MariaDbConsentAuthorizationRepository {
     accountId: string,
     clientId: string,
     currentSessionUid?: string,
+    now = Date.now(),
   ): Promise<ConsentAuthorizationState | null> {
     const connection = await this.pool.getConnection();
     try {
@@ -750,20 +751,45 @@ export class MariaDbConsentAuthorizationRepository {
         await connection.commit();
         return existing;
       }
+      let retiredReauthenticationBridges = this.liveRetiredBridges(
+        existing,
+        now,
+      );
+      if (
+        existing.lifecycle === "pending_reauth" &&
+        existing.pendingBridgeFingerprint !== undefined &&
+        existing.pendingReauthentication !== undefined
+      ) {
+        retiredReauthenticationBridges = this.retireBridge(
+          retiredReauthenticationBridges,
+          existing.pendingBridgeFingerprint,
+          existing.pendingReauthentication.expiresAt,
+          now,
+        );
+      }
+      const sessionIds = [
+        ...new Set([
+          ...existing.sessionIds,
+          ...(existing.pendingReauthentication === undefined
+            ? []
+            : [existing.pendingReauthentication.sessionUid]),
+          ...(currentSessionUid === undefined ? [] : [currentSessionUid]),
+        ]),
+      ];
+      if (sessionIds.length > this.maximumSessions) {
+        throw new ReauthenticationBridgeCapacityError(
+          "reauthentication session capacity is exhausted",
+        );
+      }
       const cleanupPending: ConsentAuthorizationState = {
         ...existing,
         lifecycle: "cleanup_pending",
-        sessionIds: [
-          ...new Set([
-            ...existing.sessionIds,
-            ...(existing.pendingReauthentication === undefined
-              ? []
-              : [existing.pendingReauthentication.sessionUid]),
-            ...(currentSessionUid === undefined ? [] : [currentSessionUid]),
-          ]),
-        ],
+        sessionIds,
         accountActive: existing.accountActive,
         pendingReauthentication: undefined,
+        pendingBridgeFingerprint: undefined,
+        pendingAuthorizationEpoch: undefined,
+        retiredReauthenticationBridges,
         consumedProofDigest: undefined,
       };
       await this.writeStateLocked(connection, accountId, cleanupPending);
