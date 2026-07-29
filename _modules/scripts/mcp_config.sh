@@ -72,6 +72,8 @@ mcp_validate_config() {
   local encryption_key
   local config_version
   local profiles
+  local activation_local_verify
+  local https_port
 
   [[ -f "${config_path}" ]] || {
     echo "MCP configuration file is missing" >&2
@@ -125,6 +127,7 @@ mcp_validate_config() {
   local default_key
   local -a default_keys=(
     MCP_UPDATE_OFFERED
+    MCP_ACTIVATION_LOCAL_VERIFY
     MCP_DBNAME
     MCP_DBUSER
     MCP_OAUTH_ALLOWED_REDIRECT_URIS
@@ -154,6 +157,30 @@ mcp_validate_config() {
     echo "MCP_UPDATE_OFFERED must be 0 or 1" >&2
     return 1
   }
+
+  activation_local_verify="$(
+    mcp_config_value "${config_path}" MCP_ACTIVATION_LOCAL_VERIFY
+  )" || {
+    echo "MCP_ACTIVATION_LOCAL_VERIFY must be set exactly once" >&2
+    return 1
+  }
+  [[ "${activation_local_verify}" =~ ^[01]$ ]] || {
+    echo "MCP_ACTIVATION_LOCAL_VERIFY must be 0 or 1" >&2
+    return 1
+  }
+
+  if [[ "${activation_local_verify}" == 1 ]] &&
+    mcp_config_has_key "${config_path}" HTTPS_PORT; then
+    https_port="$(mcp_config_value "${config_path}" HTTPS_PORT)" || {
+      echo "HTTPS_PORT must be set at most once for MCP local activation verification" >&2
+      return 1
+    }
+    if [[ ! "${https_port}" =~ ^[0-9]{1,5}$ ]] ||
+      (( 10#${https_port} < 1 || 10#${https_port} > 65535 )); then
+      echo "HTTPS_PORT must be an integer from 1 through 65535 for MCP local activation verification" >&2
+      return 1
+    fi
+  fi
 }
 
 mcp_append_if_missing() {
@@ -170,6 +197,7 @@ mcp_append_defaults() {
 
   mcp_append_if_missing "${config_path}" COMPOSE_PROFILES ""
   mcp_append_if_missing "${config_path}" MCP_UPDATE_OFFERED "$([[ "${install_type}" == "new" ]] && printf 1 || printf 0)"
+  mcp_append_if_missing "${config_path}" MCP_ACTIVATION_LOCAL_VERIFY 0
   mcp_append_if_missing "${config_path}" MCP_DBNAME mailcow_mcp
   mcp_append_if_missing "${config_path}" MCP_DBUSER mailcow_mcp
   mcp_append_if_missing "${config_path}" MCP_OAUTH_ALLOWED_REDIRECT_URIS 'https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback'

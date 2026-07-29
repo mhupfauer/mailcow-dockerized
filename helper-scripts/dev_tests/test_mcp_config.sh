@@ -30,11 +30,29 @@ secret_hashes() {
   grep -E '^MCP_(DBPASS|ENCRYPTION_KEY)=' "$1" | sha256sum | awk '{print $1}'
 }
 
+replace_config_value() {
+  local path="$1"
+  local key="$2"
+  local value="$3"
+  local next="${path}.next"
+
+  awk -F= -v key="${key}" -v value="${value}" '
+    $1 == key { print key "=" value; matches++; next }
+    { print }
+    END { if (matches != 1) exit 1 }
+  ' "${path}" > "${next}" || {
+    rm -f -- "${next}"
+    return 1
+  }
+  mv "${next}" "${path}"
+}
+
 assert_mcp_defaults() {
   local config_path="$1"
   local update_offered="$2"
   local expected
   local -a expected_defaults=(
+    'MCP_ACTIVATION_LOCAL_VERIFY=0'
     'MCP_DBNAME=mailcow_mcp'
     'MCP_DBUSER=mailcow_mcp'
     'MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback'
@@ -216,6 +234,63 @@ test_generators_delegate_to_shared_mcp_migration() {
   pass "new and upgrade generators delegate to the shared MCP migration"
 }
 
+test_activation_local_verify_migration_and_validation() {
+  local case_dir="${TEST_DIR}/local-verify"
+  local config_path="${case_dir}/mailcow.conf"
+  local before_hash
+  local invalid
+  local invalid_path
+  local invalid_value
+
+  mkdir -p "${case_dir}"
+  printf 'MAILCOW_HOSTNAME=mail.example.test\n' > "${config_path}"
+  mcp_prepare_config "${config_path}" upgrade
+  grep -qx 'MCP_ACTIVATION_LOCAL_VERIFY=0' "${config_path}" ||
+    fail "local activation verification did not default to strict mode"
+
+  replace_config_value "${config_path}" MCP_ACTIVATION_LOCAL_VERIFY 1
+  printf 'HTTPS_PORT=8443\n' >> "${config_path}"
+  before_hash="$(secret_hashes "${config_path}")"
+  mcp_prepare_config "${config_path}" upgrade
+  grep -qx 'MCP_ACTIVATION_LOCAL_VERIFY=1' "${config_path}" ||
+    fail "explicit local activation verification was not preserved"
+  grep -qx 'HTTPS_PORT=8443' "${config_path}" ||
+    fail "explicit HTTPS port was not preserved"
+  test "${before_hash}" = "$(secret_hashes "${config_path}")" ||
+    fail "local verification migration changed existing secrets"
+
+  for invalid in mode port-zero port-high port-text; do
+    invalid_path="${case_dir}/${invalid}.conf"
+    cp "${config_path}" "${invalid_path}"
+    case "${invalid}" in
+      mode)
+        replace_config_value "${invalid_path}" \
+          MCP_ACTIVATION_LOCAL_VERIFY yes
+        ;;
+      port-zero)
+        invalid_value=0
+        replace_config_value "${invalid_path}" HTTPS_PORT "${invalid_value}"
+        ;;
+      port-high)
+        invalid_value=65536
+        replace_config_value "${invalid_path}" HTTPS_PORT "${invalid_value}"
+        ;;
+      port-text)
+        invalid_value=not-a-port
+        replace_config_value "${invalid_path}" HTTPS_PORT "${invalid_value}"
+        ;;
+    esac
+    before_hash="$(sha256sum "${invalid_path}" | awk '{print $1}')"
+    if mcp_prepare_config "${invalid_path}" upgrade >/dev/null 2>&1; then
+      fail "invalid local activation configuration ${invalid} succeeded"
+    fi
+    test "${before_hash}" = \
+      "$(sha256sum "${invalid_path}" | awk '{print $1}')" ||
+      fail "invalid local activation configuration ${invalid} mutated the file"
+  done
+  pass "local activation verification migrates and validates safely"
+}
+
 test_upgrade_generates_durable_config
 test_marker_with_missing_key_fails_without_mutation
 test_versioned_config_gets_missing_non_secret_defaults
@@ -224,3 +299,4 @@ test_profile_helpers_match_exact_tokens
 test_interrupted_rename_leaves_existing_config_intact
 test_new_install_marks_offer_handled
 test_generators_delegate_to_shared_mcp_migration
+test_activation_local_verify_migration_and_validation
