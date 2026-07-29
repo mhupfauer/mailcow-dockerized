@@ -273,12 +273,23 @@ else
     exit 0
   fi
   if [[ -n "${header_file}" ]]; then
-    if [[ "${MCP_TEST_INVALID_RESPONSE:-}" == challenge ]]; then
-      printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer\r\n\r\n' > "${header_file}"
-    else
-      printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer resource_metadata="%s/.well-known/oauth-protected-resource/mcp"\r\n\r\n' \
-        "${issuer}" > "${header_file}"
-    fi
+    case "${MCP_TEST_INVALID_RESPONSE:-}" in
+      challenge)
+        printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer\r\n\r\n' > "${header_file}"
+        ;;
+      challenge-scheme)
+        printf 'HTTP/2 401\r\nWWW-Authenticate: Basic resource_metadata="%s/.well-known/oauth-protected-resource/mcp"\r\n\r\n' \
+          "${issuer}" > "${header_file}"
+        ;;
+      challenge-url)
+        printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer error="invalid_token", resource_metadata="https://wrong.example.test/.well-known/oauth-protected-resource/mcp"\r\n\r\n' \
+          > "${header_file}"
+        ;;
+      *)
+        printf 'HTTP/2 401\r\nWWW-Authenticate: Bearer scope="mail.read", resource_metadata="%s/.well-known/oauth-protected-resource/mcp", error_description="Missing Authorization header", error="invalid_token"\r\n\r\n' \
+          "${issuer}" > "${header_file}"
+        ;;
+    esac
   fi
   printf '401'
 fi
@@ -682,7 +693,7 @@ test_https_verification_retries_and_validates_metadata() {
       fail "${staged} staged readiness did not complete activation"
   done
 
-  for invalid in authorization-json protected-json challenge; do
+  for invalid in authorization-json protected-json challenge challenge-scheme challenge-url; do
     case_dir="$(make_case "invalid-${invalid}")"
     cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
     if MCP_TEST_INVALID_RESPONSE="${invalid}" run_mcp "${case_dir}" enable >/dev/null 2>&1; then

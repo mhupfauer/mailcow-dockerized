@@ -19,6 +19,7 @@ import {
   InactiveAuthorizationAccountError,
   InvalidReauthenticationProofError,
   MariaDbConsentAuthorizationRepository,
+  ReauthenticationBridgeCapacityError,
   type AuthorizationMutationCoordinator,
 } from "./authorization-state.js";
 import {
@@ -1150,33 +1151,48 @@ export function createInteractionRouter(
                   mailbox,
                   appPassword,
                 );
-            const proof = randomBytes(32).toString("base64url");
-            const expiresAt = now() + pendingReauthenticationTtlMs;
-            const bridge =
-              await consentRepository.issueReauthenticationBridge(
+            const authorityLease =
+              await dependencies.authorityMutations.acquire(
                 verified.accountId,
                 clientId,
                 dependencies.resource.href,
-                {
-                  proof,
-                  authorizationEpoch: verified.authorizationEpoch,
-                  expiresAt,
-                },
               );
-            await dependencies.provider.interactionFinished(
-              request,
-              response,
-              {
-                login: {
-                  accountId: verified.accountId,
-                  reauthenticationProof: bridge.proof,
-                  authorizationEpoch: bridge.authorizationEpoch,
-                  reauthenticationExpiresAt: bridge.expiresAt,
-                  reauthenticationBinding: bridge.bindingEnvelope,
-                },
-              } as InteractionResults,
-              { mergeWithLastSubmission: false },
-            );
+            if (authorityLease === null) {
+              throw new ReauthenticationBridgeCapacityError(
+                "authorization mutation capacity is exhausted",
+              );
+            }
+            try {
+              const proof = randomBytes(32).toString("base64url");
+              const expiresAt = now() + pendingReauthenticationTtlMs;
+              const bridge =
+                await consentRepository.issueReauthenticationBridge(
+                  verified.accountId,
+                  clientId,
+                  dependencies.resource.href,
+                  {
+                    proof,
+                    authorizationEpoch: verified.authorizationEpoch,
+                    expiresAt,
+                  },
+                );
+              await dependencies.provider.interactionFinished(
+                request,
+                response,
+                {
+                  login: {
+                    accountId: verified.accountId,
+                    reauthenticationProof: bridge.proof,
+                    authorizationEpoch: bridge.authorizationEpoch,
+                    reauthenticationExpiresAt: bridge.expiresAt,
+                    reauthenticationBinding: bridge.bindingEnvelope,
+                  },
+                } as InteractionResults,
+                { mergeWithLastSubmission: false },
+              );
+            } finally {
+              authorityLease.release();
+            }
           } catch {
             if (!response.headersSent) {
               reject(

@@ -7,7 +7,9 @@ import { createApp } from "./app.js";
 import { MariaDbAccountRepository } from "./auth/account-repository.js";
 import {
   BoundedAuthorizationMutationCoordinator,
+  MariaDbConsentAuthorizationRepository,
 } from "./auth/authorization-state.js";
+import { MariaDbProtocolGrantRevoker } from "./auth/authorization-revoker.js";
 import { DualProtocolCredentialVerifier } from "./auth/credential-verifier.js";
 import { AesGcmCredentialVault } from "./auth/crypto-vault.js";
 import { createOidcProvider } from "./auth/oidc-provider.js";
@@ -104,18 +106,28 @@ export async function startProductionServer(
   });
 
   try {
+    const vault = new AesGcmCredentialVault(config.encryptionKey);
+    const accountRepository = new MariaDbAccountRepository(pool, vault);
+    const authorityMutations = new BoundedAuthorizationMutationCoordinator(
+      1_000,
+    );
+    const authorizationRepository =
+      new MariaDbConsentAuthorizationRepository(
+        pool,
+        vault,
+        config.resource.href,
+      );
     const oidcProvider = await createOidcProvider({
       pool,
       issuer: config.issuer,
       resource: config.resource,
       encryptionKey: config.encryptionKey,
       env,
+      protocolGrantRevoker: new MariaDbProtocolGrantRevoker(
+        authorizationRepository,
+        authorityMutations,
+      ),
     });
-    const vault = new AesGcmCredentialVault(config.encryptionKey);
-    const accountRepository = new MariaDbAccountRepository(pool, vault);
-    const authorityMutations = new BoundedAuthorizationMutationCoordinator(
-      1_000,
-    );
     const credentialVerifier = new DualProtocolCredentialVerifier({
       hostname: config.hostname,
       ca: trustSource,
@@ -128,6 +140,7 @@ export async function startProductionServer(
       resourceMetadataUrl: config.resourceMetadataUrl,
       resource: config.resource,
       oidcProvider,
+      authorizationRepository,
       registrationsPerHour: config.registrationsPerHour,
       interactions: {
         accountRepository,

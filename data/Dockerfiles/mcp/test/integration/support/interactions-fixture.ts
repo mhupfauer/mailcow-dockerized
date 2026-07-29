@@ -9,7 +9,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect } from "vitest";
 
 import { createApp } from "../../../src/app.js";
 import { MariaDbAccountRepository } from "../../../src/auth/account-repository.js";
-import { BoundedAuthorizationMutationCoordinator } from "../../../src/auth/authorization-state.js";
+import {
+  BoundedAuthorizationMutationCoordinator,
+  MariaDbConsentAuthorizationRepository,
+} from "../../../src/auth/authorization-state.js";
+import { MariaDbProtocolGrantRevoker } from "../../../src/auth/authorization-revoker.js";
 import type { CredentialVerifier } from "../../../src/auth/credential-verifier.js";
 import { AesGcmCredentialVault } from "../../../src/auth/crypto-vault.js";
 import { createOidcProvider } from "../../../src/auth/oidc-provider.js";
@@ -192,6 +196,7 @@ export let server: ReturnType<ReturnType<typeof createApp>["listen"]>;
 export let app: ReturnType<typeof createApp>;
 export let accountRepository: MariaDbAccountRepository;
 export let authorityMutations: BoundedAuthorizationMutationCoordinator;
+let authorizationRepository: MariaDbConsentAuthorizationRepository;
 let container: StartedTestContainer;
 let credentialVerifier: CredentialVerifier;
 
@@ -206,6 +211,29 @@ export const interactionState: {
   verificationDelayMs: 0,
   verificationStarted: undefined,
 };
+
+async function rebuildProviderAndAuthority(
+  maximumAuthorityMutations = 1_000,
+): Promise<void> {
+  authorityMutations = new BoundedAuthorizationMutationCoordinator(
+    maximumAuthorityMutations,
+  );
+  authorizationRepository = new MariaDbConsentAuthorizationRepository(
+    pool,
+    new AesGcmCredentialVault(encryptionKey),
+    resource.href,
+  );
+  provider = await createOidcProvider({
+    pool,
+    issuer,
+    resource,
+    encryptionKey,
+    protocolGrantRevoker: new MariaDbProtocolGrantRevoker(
+      authorizationRepository,
+      authorityMutations,
+    ),
+  });
+}
 
 export function installInteractionsFixture(): void {
   beforeAll(async () => {
@@ -260,7 +288,7 @@ export function installInteractionsFixture(): void {
       pool,
       new AesGcmCredentialVault(encryptionKey),
     );
-    provider = await createOidcProvider({ pool, issuer, resource, encryptionKey });
+    await rebuildProviderAndAuthority();
     await startApp();
   });
 
@@ -286,6 +314,11 @@ export async function startApp(
     proofNow?: () => number;
     verificationTimeoutMs?: number;
     mcpNow?: () => number;
+    mcpMaximumTotalSessions?: number;
+    mcpMaximumSessionsPerAuthority?: number;
+    mcpMaximumInitializationsInFlight?: number;
+    mcpInitializationsPerWindow?: number;
+    mcpInitializationWindowMs?: number;
   } = {},
 ): Promise<void> {
   if (server?.listening) {
@@ -295,19 +328,42 @@ export async function startApp(
     });
   }
   const {
-    maximumAuthorityMutations = 1_000,
+    maximumAuthorityMutations,
     reauthenticationProofTtlMs = 10 * 60 * 1_000,
     proofNow,
     mcpNow,
+    mcpMaximumTotalSessions,
+    mcpMaximumSessionsPerAuthority,
+    mcpMaximumInitializationsInFlight,
+    mcpInitializationsPerWindow,
+    mcpInitializationWindowMs,
     ...interactionOverrides
   } = overrides;
-  authorityMutations = new BoundedAuthorizationMutationCoordinator(maximumAuthorityMutations);
+  if (maximumAuthorityMutations !== undefined) {
+    await rebuildProviderAndAuthority(maximumAuthorityMutations);
+  }
   app = createApp({
     readiness: async () => true,
     resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource/mcp", issuer),
     resource,
     oidcProvider: provider,
+    authorizationRepository,
     ...(mcpNow === undefined ? {} : { mcpNow }),
+    ...(mcpMaximumTotalSessions === undefined
+      ? {}
+      : { mcpMaximumTotalSessions }),
+    ...(mcpMaximumSessionsPerAuthority === undefined
+      ? {}
+      : { mcpMaximumSessionsPerAuthority }),
+    ...(mcpMaximumInitializationsInFlight === undefined
+      ? {}
+      : { mcpMaximumInitializationsInFlight }),
+    ...(mcpInitializationsPerWindow === undefined
+      ? {}
+      : { mcpInitializationsPerWindow }),
+    ...(mcpInitializationWindowMs === undefined
+      ? {}
+      : { mcpInitializationWindowMs }),
     interactions: {
       accountRepository,
       credentialVerifier,
@@ -331,8 +387,12 @@ export async function startApp(
 export async function restartProviderAndApp(
   overrides: Parameters<typeof startApp>[0] = {},
 ): Promise<void> {
-  provider = await createOidcProvider({ pool, issuer, resource, encryptionKey });
-  await startApp(overrides);
+  const {
+    maximumAuthorityMutations = 1_000,
+    ...appOverrides
+  } = overrides;
+  await rebuildProviderAndAuthority(maximumAuthorityMutations);
+  await startApp(appOverrides);
 }
 
 export async function registerClient(): Promise<string> {

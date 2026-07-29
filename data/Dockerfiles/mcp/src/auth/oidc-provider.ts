@@ -39,6 +39,21 @@ interface CreateOidcProviderDependencies {
   env?: NodeJS.ProcessEnv;
   allowedRedirectUris?: readonly string[];
   allowLoopbackRedirects?: boolean;
+  protocolGrantRevoker?: ProtocolGrantRevoker;
+}
+
+export interface ProtocolGrantRevocationLease {
+  sessionIds: readonly string[];
+  release(): void;
+}
+
+export interface ProtocolGrantRevoker {
+  prepare(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    grantId: string,
+  ): Promise<ProtocolGrantRevocationLease>;
 }
 
 interface OidcProviderPolicy {
@@ -245,6 +260,23 @@ function cookieKeys(encryptionKey: Uint8Array): Buffer[] {
   ];
 }
 
+function revokingTokenResource(token: {
+  kind: string;
+  aud?: unknown;
+  resource?: unknown;
+}): string | null {
+  const value = token.kind === "AccessToken" ? token.aud : token.resource;
+  if (typeof value === "string" && value !== "") {
+    return value;
+  }
+  return Array.isArray(value) &&
+    value.length === 1 &&
+    typeof value[0] === "string" &&
+    value[0] !== ""
+    ? value[0]
+    : null;
+}
+
 export async function createOidcProvider(
   dependencies: CreateOidcProviderDependencies,
 ): Promise<Provider> {
@@ -301,7 +333,55 @@ export async function createOidcProvider(
           };
         },
       },
-      revocation: { enabled: true },
+      revocation: {
+        enabled: true,
+        allowedPolicy: async (context, client, token) => {
+          if (token.clientId !== client.clientId) {
+            return false;
+          }
+          if (
+            token.kind !== "AccessToken" &&
+            token.kind !== "RefreshToken"
+          ) {
+            return true;
+          }
+          const accountId = token.accountId;
+          const grantId = token.grantId;
+          const tokenResource = revokingTokenResource(token);
+          if (
+            dependencies.protocolGrantRevoker === undefined ||
+            typeof accountId !== "string" ||
+            accountId === "" ||
+            typeof token.clientId !== "string" ||
+            token.clientId === "" ||
+            typeof grantId !== "string" ||
+            grantId === "" ||
+            tokenResource === null ||
+            tokenResource !== dependencies.resource.href
+          ) {
+            throw new Error("durable grant revocation is unavailable");
+          }
+          const lease =
+            await dependencies.protocolGrantRevoker.prepare(
+              accountId,
+              token.clientId,
+              tokenResource,
+              grantId,
+            );
+          try {
+            for (const sessionId of lease.sessionIds) {
+              const session =
+                await context.oidc.provider.Session.findByUid(sessionId);
+              await session?.destroy();
+            }
+            revocationLeases.set(context, lease);
+            return true;
+          } catch (error) {
+            lease.release();
+            throw error;
+          }
+        },
+      },
       rpInitiatedLogout: { enabled: false },
       userinfo: { enabled: false },
     },
@@ -339,6 +419,19 @@ export async function createOidcProvider(
     issuer.href.replace(/\/$/u, ""),
     configuration,
   );
+  const revocationLeases =
+    new WeakMap<object, ProtocolGrantRevocationLease>();
+  provider.use(async (context, next) => {
+    try {
+      await next();
+    } finally {
+      const lease = revocationLeases.get(context);
+      if (lease !== undefined) {
+        revocationLeases.delete(context);
+        lease.release();
+      }
+    }
+  });
   provider.use(async (context, next) => {
     if (context.method === "GET" && context.path === "/oauth/auth") {
       if (!Object.hasOwn(context.query, "scope")) {

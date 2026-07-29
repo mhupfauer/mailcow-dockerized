@@ -9,6 +9,7 @@ import {
   createInteractionRouter,
   type InteractionDependencies,
 } from "./auth/interactions.js";
+import type { MariaDbConsentAuthorizationRepository } from "./auth/authorization-state.js";
 import { AccessTokenVerifier } from "./auth/token-verifier.js";
 import { createIpRateLimiter } from "./http/rate-limit.js";
 import { createMcpMetadataRouter } from "./http/metadata.js";
@@ -19,9 +20,18 @@ interface AppDependencies {
   resource?: URL;
   resourceMetadataUrl: URL;
   oidcProvider?: Provider;
+  authorizationRepository?: Pick<
+    MariaDbConsentAuthorizationRepository,
+    "getActive"
+  >;
   registrationsPerHour?: number;
   interactions?: Omit<InteractionDependencies, "provider">;
   mcpNow?: () => number;
+  mcpMaximumTotalSessions?: number;
+  mcpMaximumSessionsPerAuthority?: number;
+  mcpMaximumInitializationsInFlight?: number;
+  mcpInitializationsPerWindow?: number;
+  mcpInitializationWindowMs?: number;
 }
 
 export interface MailcowMcpApp extends Express {
@@ -49,9 +59,12 @@ export function createApp(deps: AppDependencies): MailcowMcpApp {
   });
 
   if (deps.oidcProvider !== undefined && deps.resource !== undefined) {
+    if (deps.authorizationRepository === undefined) {
+      throw new Error("durable authorization repository is required");
+    }
     app.use(
       createMcpMetadataRouter({
-        issuer: new URL(deps.oidcProvider.issuer),
+        issuer: deps.oidcProvider.issuer,
         resource: deps.resource,
       }),
     );
@@ -59,15 +72,42 @@ export function createApp(deps: AppDependencies): MailcowMcpApp {
       verifier: new AccessTokenVerifier({
         provider: deps.oidcProvider,
         resource: deps.resource,
+        authorizationRepository: deps.authorizationRepository,
       }),
       resourceMetadataUrl: deps.resourceMetadataUrl,
       ...(deps.mcpNow === undefined ? {} : { now: deps.mcpNow }),
+      ...(deps.mcpMaximumTotalSessions === undefined
+        ? {}
+        : { maximumTotalSessions: deps.mcpMaximumTotalSessions }),
+      ...(deps.mcpMaximumSessionsPerAuthority === undefined
+        ? {}
+        : {
+            maximumSessionsPerAuthority:
+              deps.mcpMaximumSessionsPerAuthority,
+          }),
+      ...(deps.mcpMaximumInitializationsInFlight === undefined
+        ? {}
+        : {
+            maximumInitializationsInFlight:
+              deps.mcpMaximumInitializationsInFlight,
+          }),
+      ...(deps.mcpInitializationsPerWindow === undefined
+        ? {}
+        : {
+            initializationsPerWindow:
+              deps.mcpInitializationsPerWindow,
+          }),
+      ...(deps.mcpInitializationWindowMs === undefined
+        ? {}
+        : {
+            initializationWindowMs: deps.mcpInitializationWindowMs,
+          }),
     });
     app.closeMcpSessions = mcp.closeAllSessions;
     app.all(
       "/mcp",
       mcp.authenticate,
-      express.json({ strict: true }),
+      express.json({ limit: "25mb", strict: true }),
       mcp.handle,
     );
   } else {

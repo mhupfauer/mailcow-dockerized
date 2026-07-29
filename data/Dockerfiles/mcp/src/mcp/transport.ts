@@ -8,8 +8,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import { requireAccountContext } from "./context.js";
 import { createMcpServer } from "./server.js";
+import { createIpRateLimiter } from "../http/rate-limit.js";
 
 const sessionInactivityMs = 30 * 60 * 1_000;
+const defaultMaximumTotalSessions = 256;
+const defaultMaximumSessionsPerAuthority = 8;
+const defaultMaximumInitializationsInFlight = 16;
+const defaultInitializationsPerWindow = 10;
+const defaultInitializationWindowMs = 60_000;
+const capacityRetryAfterSeconds = 1;
 
 interface Session {
   accountId: string;
@@ -26,6 +33,11 @@ interface McpTransportDependencies {
   verifier: OAuthTokenVerifier;
   resourceMetadataUrl: URL;
   now?: () => number;
+  maximumTotalSessions?: number;
+  maximumSessionsPerAuthority?: number;
+  maximumInitializationsInFlight?: number;
+  initializationsPerWindow?: number;
+  initializationWindowMs?: number;
 }
 
 export interface McpTransportController {
@@ -47,10 +59,53 @@ export function createMcpTransportController({
   verifier,
   resourceMetadataUrl,
   now = Date.now,
+  maximumTotalSessions = defaultMaximumTotalSessions,
+  maximumSessionsPerAuthority = defaultMaximumSessionsPerAuthority,
+  maximumInitializationsInFlight =
+    defaultMaximumInitializationsInFlight,
+  initializationsPerWindow = defaultInitializationsPerWindow,
+  initializationWindowMs = defaultInitializationWindowMs,
 }: McpTransportDependencies): McpTransportController {
+  if (
+    [
+      maximumTotalSessions,
+      maximumSessionsPerAuthority,
+      maximumInitializationsInFlight,
+      initializationsPerWindow,
+      initializationWindowMs,
+    ].some((value) => !Number.isSafeInteger(value) || value < 1)
+  ) {
+    throw new Error("invalid MCP transport limits");
+  }
   const sessions = new Map<string, Session>();
   const initializationsInFlight = new Set<Promise<void>>();
+  const initializationReservations = new Map<string, number>();
+  let totalInitializationReservations = 0;
+  const initializationLimiter = createIpRateLimiter({
+    limit: initializationsPerWindow,
+    windowMs: initializationWindowMs,
+    now,
+  });
   let closing = false;
+
+  const authorityKey = (accountId: string, clientId: string): string =>
+    `${accountId}\u0000${clientId}`;
+
+  const authoritySessionCount = (
+    accountId: string,
+    clientId: string,
+  ): number => {
+    let count = 0;
+    for (const session of sessions.values()) {
+      if (
+        session.accountId === accountId &&
+        session.clientId === clientId
+      ) {
+        count += 1;
+      }
+    }
+    return count;
+  };
 
   const closeSession = async (sessionId: string): Promise<boolean> => {
     const session = sessions.get(sessionId);
@@ -91,7 +146,7 @@ export function createMcpTransportController({
 
   const authenticate = requireBearerAuth({
     verifier,
-    requiredScopes: ["mail.read"],
+    requiredScopes: [],
     resourceMetadataUrl: resourceMetadataUrl.href,
   });
 
@@ -104,8 +159,12 @@ export function createMcpTransportController({
 
     let account;
     try {
-      account = requireAccountContext(authInfo, "mail.read");
+      account = requireAccountContext(authInfo);
     } catch {
+      response.set(
+        "WWW-Authenticate",
+        `Bearer error="insufficient_scope", error_description="Insufficient scope", scope="mail.read mail.send mail.organize", resource_metadata="${resourceMetadataUrl.href}"`,
+      );
       response.status(403).json({ error: "insufficient_scope" });
       return;
     }
@@ -149,58 +208,129 @@ export function createMcpTransportController({
       return;
     }
 
-    const server = createMcpServer(account);
-    let transport: StreamableHTTPServerTransport;
-    transport = new StreamableHTTPServerTransport({
-      enableJsonResponse: true,
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (newSessionId) => {
-        const initializedAt = now();
-        const expiresInMs = Math.max(
-          0,
-          authInfo.expiresAt! * 1_000 - initializedAt,
+    const currentAuthorityKey = authorityKey(
+      account.accountId,
+      account.clientId,
+    );
+    if (
+      sessions.size + totalInitializationReservations >=
+      maximumTotalSessions
+    ) {
+      response.set("Retry-After", capacityRetryAfterSeconds.toString());
+      response.status(503).json({ error: "session_capacity_exhausted" });
+      return;
+    }
+    if (
+      authoritySessionCount(account.accountId, account.clientId) +
+        (initializationReservations.get(currentAuthorityKey) ?? 0) >=
+      maximumSessionsPerAuthority
+    ) {
+      response.set("Retry-After", capacityRetryAfterSeconds.toString());
+      response.status(429).json({
+        error: "authority_session_capacity_exhausted",
+      });
+      return;
+    }
+    if (
+      initializationsInFlight.size >=
+      maximumInitializationsInFlight
+    ) {
+      response.set("Retry-After", capacityRetryAfterSeconds.toString());
+      response.status(503).json({
+        error: "initialization_capacity_exhausted",
+      });
+      return;
+    }
+    const rateLimit = initializationLimiter.consume(currentAuthorityKey);
+    if (!rateLimit.allowed) {
+      response.set("Retry-After", rateLimit.retryAfter.toString());
+      response.status(429).json({
+        error: "initialization_rate_limited",
+      });
+      return;
+    }
+
+    totalInitializationReservations += 1;
+    initializationReservations.set(
+      currentAuthorityKey,
+      (initializationReservations.get(currentAuthorityKey) ?? 0) + 1,
+    );
+    let reservationActive = true;
+    const releaseReservation = (): void => {
+      if (!reservationActive) {
+        return;
+      }
+      reservationActive = false;
+      totalInitializationReservations -= 1;
+      const authorityReservations =
+        initializationReservations.get(currentAuthorityKey) ?? 0;
+      if (authorityReservations <= 1) {
+        initializationReservations.delete(currentAuthorityKey);
+      } else {
+        initializationReservations.set(
+          currentAuthorityKey,
+          authorityReservations - 1,
         );
-        const session: Session = {
-          accountId: account.accountId,
-          clientId: account.clientId,
-          expiresAt: authInfo.expiresAt!,
-          lastActivityAt: initializedAt,
-          server,
-          transport,
-          inactivityTimer: setTimeout(() => {
-            void closeSession(newSessionId);
-          }, sessionInactivityMs),
-          expiryTimer: setTimeout(() => {
-            void closeSession(newSessionId);
-          }, expiresInMs),
-        };
-        sessions.set(newSessionId, session);
-      },
-      onsessionclosed: async (closedSessionId) => {
-        await closeSession(closedSessionId);
-      },
-    });
-    transport.onclose = () => {
-      const activeSessionId = transport.sessionId;
-      if (activeSessionId !== undefined) {
-        const session = sessions.get(activeSessionId);
-        if (session !== undefined) {
-          sessions.delete(activeSessionId);
-          clearTimeout(session.inactivityTimer);
-          clearTimeout(session.expiryTimer);
-        }
       }
     };
 
-    const initialization = (async () => {
-      await server.connect(transport);
-      await transport.handleRequest(request, response, request.body);
-    })();
-    initializationsInFlight.add(initialization);
     try {
-      await initialization;
+      const server = createMcpServer(account);
+      let transport: StreamableHTTPServerTransport;
+      transport = new StreamableHTTPServerTransport({
+        enableJsonResponse: true,
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          releaseReservation();
+          const initializedAt = now();
+          const expiresInMs = Math.max(
+            0,
+            account.tokenExpiresAt * 1_000 - initializedAt,
+          );
+          const session: Session = {
+            accountId: account.accountId,
+            clientId: account.clientId,
+            expiresAt: account.tokenExpiresAt,
+            lastActivityAt: initializedAt,
+            server,
+            transport,
+            inactivityTimer: setTimeout(() => {
+              void closeSession(newSessionId);
+            }, sessionInactivityMs),
+            expiryTimer: setTimeout(() => {
+              void closeSession(newSessionId);
+            }, expiresInMs),
+          };
+          sessions.set(newSessionId, session);
+        },
+        onsessionclosed: async (closedSessionId) => {
+          await closeSession(closedSessionId);
+        },
+      });
+      transport.onclose = () => {
+        const activeSessionId = transport.sessionId;
+        if (activeSessionId !== undefined) {
+          const session = sessions.get(activeSessionId);
+          if (session !== undefined) {
+            sessions.delete(activeSessionId);
+            clearTimeout(session.inactivityTimer);
+            clearTimeout(session.expiryTimer);
+          }
+        }
+      };
+
+      const initialization = (async () => {
+        await server.connect(transport);
+        await transport.handleRequest(request, response, request.body);
+      })();
+      initializationsInFlight.add(initialization);
+      try {
+        await initialization;
+      } finally {
+        initializationsInFlight.delete(initialization);
+      }
     } finally {
-      initializationsInFlight.delete(initialization);
+      releaseReservation();
     }
   };
 

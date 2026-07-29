@@ -44,6 +44,11 @@ const execFileAsync = promisify(execFile);
 const mailcowTestCertificate = fileURLToPath(
   new URL("../../../../assets/ssl-example/cert.pem", import.meta.url),
 );
+const noDurableConsent = {
+  async prepare() {
+    return { sessionIds: [], release() {} };
+  },
+};
 
 interface HttpResponse {
   status: number;
@@ -440,6 +445,7 @@ describe("OAuth provider policy", () => {
       issuer,
       resource,
       encryptionKey: Buffer.from(encryptionKeyHex, "hex"),
+      protocolGrantRevoker: noDurableConsent,
     });
   });
 

@@ -768,6 +768,279 @@ describe("mailcow authorization lifecycle", () => {
     ).rejects.toThrow("reauthentication proof is invalid");
   });
 
+  test("rejects an issued but unstaged bridge after client cleanup and accepts a fresh bridge", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "unstaged-cleanup-bridge@example.test",
+      "app-password",
+    );
+    const clientId = "unstaged-cleanup-bridge-client";
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const initialBridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "d".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "initial-session",
+      initialBridge,
+      100,
+    );
+    await consentRepository.activatePending(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "initial-session",
+      initialBridge,
+      100,
+      {
+        scopes: ["mail.read"],
+        grantId: "initial-grant",
+        sessionIds: ["initial-session"],
+      },
+    );
+    const staleBridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "e".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+
+    await consentRepository.beginClientCleanup(
+      verified.accountId,
+      clientId,
+      undefined,
+      101,
+    );
+    await consentRepository.completeClientCleanup(
+      verified.accountId,
+      clientId,
+    );
+
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "stale-session",
+        staleBridge,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+
+    const freshBridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "f".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    await expect(
+      consentRepository.stagePendingReauthentication(
+        verified.accountId,
+        clientId,
+        resource.href,
+        "fresh-session",
+        freshBridge,
+        102,
+      ),
+    ).resolves.toMatchObject({
+      lifecycle: "pending_reauth",
+      scopes: [],
+      sessionIds: [],
+    });
+  });
+
+  test("serializes bridge issuance behind an earlier same-authority mutation", async () => {
+    const clientId = await registerClient();
+    const login = await loginPage(clientId);
+    const loggedIn = await submitLogin(login.path, login.response);
+    const consent = await reachConsent(loggedIn);
+    const approved = await client.postForm(consent.path, {
+      csrf: hidden(consent.response.body, "csrf"),
+      decision: "approve",
+    });
+    expect(approved.status).toBe(303);
+    const accountId = await accountIdForMailbox();
+    const earlierMutation = await authorityMutations.acquire(
+      accountId,
+      clientId,
+      resource.href,
+    );
+    expect(earlierMutation).not.toBeNull();
+    const freshClient = new HttpClient(
+      (server.address() as AddressInfo).port,
+    );
+    const freshLogin = await loginPageFor(freshClient, clientId);
+    let observeIssue!: () => void;
+    const issueEntered = new Promise<void>((resolve) => {
+      observeIssue = resolve;
+    });
+    const originalIssue =
+      MariaDbConsentAuthorizationRepository.prototype
+        .issueReauthenticationBridge;
+    const issue = vi
+      .spyOn(
+        MariaDbConsentAuthorizationRepository.prototype,
+        "issueReauthenticationBridge",
+      )
+      .mockImplementation(async function (...args) {
+        observeIssue();
+        return originalIssue.apply(this, args);
+      });
+
+    let response;
+    let observedOrder;
+    try {
+      const submission = freshClient.postForm(freshLogin.path, {
+        csrf: hidden(freshLogin.response.body, "csrf"),
+        mailbox: "user@example.test",
+        app_password: "replacement-app-password",
+      });
+      observedOrder = await Promise.race([
+        issueEntered.then(() => "issued-before-release"),
+        new Promise<string>((resolve) =>
+          setTimeout(() => resolve("blocked-behind-mutation"), 100),
+        ),
+      ]);
+      earlierMutation!.release();
+      response = await submission;
+    } finally {
+      earlierMutation?.release();
+      issue.mockRestore();
+    }
+
+    expect(observedOrder).toBe("blocked-behind-mutation");
+    expect(response?.status).toBe(303);
+  });
+
+  test("clears revoked grant and scopes before narrow re-consent", async () => {
+    const verified = await accountRepository.upsertVerifiedForAuthorization(
+      "narrow-reconsent@example.test",
+      "app-password",
+    );
+    const clientId = "narrow-reconsent-client";
+    const consentRepository = new MariaDbConsentAuthorizationRepository(
+      pool,
+      new AesGcmCredentialVault(encryptionKey),
+      resource.href,
+    );
+    const broadBridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "g".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "broad-session",
+      broadBridge,
+      100,
+    );
+    await consentRepository.activatePending(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "broad-session",
+      broadBridge,
+      100,
+      {
+        scopes: ["mail.read", "mail.send"],
+        grantId: "broad-grant",
+        sessionIds: ["broad-session"],
+      },
+    );
+
+    await consentRepository.beginClientCleanup(
+      verified.accountId,
+      clientId,
+      undefined,
+      101,
+    );
+    await consentRepository.completeClientCleanup(
+      verified.accountId,
+      clientId,
+    );
+    const revoked = await consentRepository.getStored(
+      verified.accountId,
+      clientId,
+    );
+    expect(revoked).toMatchObject({
+      lifecycle: "revoked",
+      scopes: [],
+      sessionIds: [],
+    });
+    expect(revoked?.grantId).toBeUndefined();
+
+    const narrowBridge = await consentRepository.issueReauthenticationBridge(
+      verified.accountId,
+      clientId,
+      resource.href,
+      {
+        proof: "h".repeat(43),
+        authorizationEpoch: verified.authorizationEpoch,
+        expiresAt: 200,
+      },
+    );
+    const pending = await consentRepository.stagePendingReauthentication(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "narrow-session",
+      narrowBridge,
+      102,
+    );
+    expect(pending).toMatchObject({
+      lifecycle: "pending_reauth",
+      scopes: [],
+    });
+    expect(pending.grantId).toBeUndefined();
+    await consentRepository.activatePending(
+      verified.accountId,
+      clientId,
+      resource.href,
+      "narrow-session",
+      narrowBridge,
+      102,
+      {
+        scopes: ["mail.read"],
+        grantId: "narrow-grant",
+        sessionIds: ["narrow-session"],
+      },
+    );
+    expect(
+      await consentRepository.getActive(verified.accountId, clientId),
+    ).toMatchObject({
+      lifecycle: "active",
+      scopes: ["mail.read"],
+      grantId: "narrow-grant",
+    });
+  });
+
   test("rolls back client cleanup when retiring a pending bridge exceeds capacity", async () => {
     const verified = await accountRepository.upsertVerifiedForAuthorization(
       "cleanup-bridge-capacity@example.test",
@@ -1084,7 +1357,7 @@ describe("mailcow authorization lifecycle", () => {
     expect(response.headers["cache-control"]).toContain("no-store");
   });
 
-  test("revokes staged pending sessions and excludes unstaged client proofs", async () => {
+  test("revokes staged pending sessions and keeps unstaged bridge authority revoked", async () => {
     const stagedClientId = await registerClient();
     const unstagedClientId = await registerClient();
     const stagedClient = new HttpClient(
@@ -1132,7 +1405,11 @@ describe("mailcow authorization lifecycle", () => {
     expect(pendingSessionUid).toBeTypeOf("string");
     expect(
       await consentRepository.getStored(accountId, unstagedClientId),
-    ).toBeNull();
+    ).toMatchObject({
+      lifecycle: "revoked",
+      scopes: [],
+      sessionIds: [],
+    });
 
     await new MariaDbAccountAuthorizationRevoker(
       consentRepository,
@@ -1152,7 +1429,11 @@ describe("mailcow authorization lifecycle", () => {
     });
     expect(
       await consentRepository.getStored(accountId, unstagedClientId),
-    ).toBeNull();
+    ).toMatchObject({
+      lifecycle: "revoked",
+      scopes: [],
+      sessionIds: [],
+    });
     const unstagedResume = await unstagedClient.get(
       locationPath(unstagedLoggedIn),
     );
@@ -2041,12 +2322,10 @@ describe("mailcow authorization lifecycle", () => {
       mailbox: "user@example.test",
       app_password: "replacement-app-password",
     });
-    const resume = await freshClient.get(locationPath(freshLoggedIn));
-    const rejected = await freshClient.get(locationPath(resume));
     held?.release();
 
-    expect(rejected.status).toBe(503);
-    expect(rejected.headers["cache-control"]).toContain("no-store");
+    expect(freshLoggedIn.status).toBe(503);
+    expect(freshLoggedIn.headers["cache-control"]).toContain("no-store");
     expect(await rawConsent(accountId, clientId)).toBe(before);
     expect(
       await new MariaDbConsentAuthorizationRepository(

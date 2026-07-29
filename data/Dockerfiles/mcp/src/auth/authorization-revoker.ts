@@ -4,6 +4,10 @@ import type {
   AuthorizationMutationCoordinator,
   MariaDbConsentAuthorizationRepository,
 } from "./authorization-state.js";
+import type {
+  ProtocolGrantRevocationLease,
+  ProtocolGrantRevoker,
+} from "./oidc-provider.js";
 
 export async function revokeProviderAuthority(
   provider: Provider,
@@ -111,6 +115,45 @@ export class MariaDbAccountAuthorizationRevoker {
     }
     if (cleanupFailed) {
       throw new Error("unable to revoke account authorization");
+    }
+  }
+}
+
+export class MariaDbProtocolGrantRevoker implements ProtocolGrantRevoker {
+  constructor(
+    private readonly consentRepository: MariaDbConsentAuthorizationRepository,
+    private readonly authorityMutations: AuthorizationMutationCoordinator,
+  ) {}
+
+  async prepare(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    grantId: string,
+  ): Promise<ProtocolGrantRevocationLease> {
+    const authorityLease = await this.authorityMutations.acquire(
+      accountId,
+      clientId,
+      resource,
+    );
+    if (authorityLease === null) {
+      throw new Error("authorization mutation capacity is exhausted");
+    }
+    try {
+      const sessionIds =
+        await this.consentRepository.revokeMatchingGrant(
+          accountId,
+          clientId,
+          resource,
+          grantId,
+        );
+      return {
+        sessionIds,
+        release: authorityLease.release,
+      };
+    } catch (error) {
+      authorityLease.release();
+      throw error;
     }
   }
 }

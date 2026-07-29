@@ -290,6 +290,21 @@ mcp_rollback_transaction() {
   return "${result_status}"
 }
 
+mcp_bearer_challenge_has_resource_metadata() {
+  local challenge="$1"
+  local expected="$2"
+  local parameters
+  local metadata_pattern='(^|,[[:space:]]*)resource_metadata="([^"]*)"([[:space:]]*,|$)'
+
+  case "${challenge}" in
+    [Bb][Ee][Aa][Rr][Ee][Rr]" "*) ;;
+    *) return 1 ;;
+  esac
+  parameters="${challenge#* }"
+  [[ "${parameters}" =~ ${metadata_pattern} ]] || return 1
+  [[ "${BASH_REMATCH[2]}" == "${expected}" ]]
+}
+
 mcp_verify_https() {
   local hostname
   local activation_local_verify
@@ -380,8 +395,9 @@ mcp_verify_https() {
                 print substr($0, index($0, ":") + 2)
               }' |
             tail -1)"
-          if [[ "${challenge}" == \
-            "Bearer resource_metadata=\"${issuer}/.well-known/oauth-protected-resource/mcp\"" ]]; then
+          if mcp_bearer_challenge_has_resource_metadata \
+            "${challenge}" \
+            "${issuer}/.well-known/oauth-protected-resource/mcp"; then
             ready=y
             break
           fi

@@ -36,6 +36,7 @@ export interface ReauthenticationBridgeClaims {
 export interface VerifiedReauthenticationBridge {
   fingerprint: string;
   authorizationEpoch: string;
+  authorizationGeneration: string;
   expiresAt: number;
 }
 
@@ -64,6 +65,7 @@ interface ConsentAuthorityV2 {
   clientId: string;
   resource: string;
   scopes: string[];
+  authorizationGeneration?: string;
   grantId?: string;
   sessionIds: string[];
   pendingReauthentication?: PendingReauthenticationAuthority;
@@ -80,13 +82,14 @@ interface ConsentAuthorityV1 {
   sessionIds: string[];
 }
 
-interface ReauthenticationBridgeBindingV1 {
-  version: 1;
+interface ReauthenticationBridgeBindingV2 {
+  version: 2;
   accountId: string;
   clientId: string;
   resource: string;
   proof: string;
   authorizationEpoch: string;
+  authorizationGeneration: string;
   expiresAt: number;
 }
 
@@ -101,6 +104,7 @@ export interface ConsentAuthorizationState {
   clientId: string;
   resource?: string;
   scopes: string[];
+  authorizationGeneration?: string;
   grantId?: string;
   sessionIds: string[];
   accountActive: boolean;
@@ -338,6 +342,13 @@ function parseAuthorityV2(
         (sessionId) => typeof sessionId === "string" && sessionId !== "",
       ) ||
       (
+        record.authorizationGeneration !== undefined &&
+        (
+          typeof record.authorizationGeneration !== "string" ||
+          !digestPattern.test(record.authorizationGeneration)
+        )
+      ) ||
+      (
         record.grantId !== undefined &&
         (typeof record.grantId !== "string" || record.grantId === "")
       ) ||
@@ -406,6 +417,9 @@ function parseAuthorityV2(
       clientId,
       resource: record.resource,
       scopes,
+      ...(typeof record.authorizationGeneration === "string"
+        ? { authorizationGeneration: record.authorizationGeneration }
+        : {}),
       ...(typeof record.grantId === "string"
         ? { grantId: record.grantId }
         : {}),
@@ -438,6 +452,9 @@ function stateFromAuthority(
     clientId: authority.clientId,
     resource: authority.resource,
     scopes: authority.scopes,
+    ...(authority.authorizationGeneration === undefined
+      ? {}
+      : { authorizationGeneration: authority.authorizationGeneration }),
     ...(authority.grantId === undefined
       ? {}
       : { grantId: authority.grantId }),
@@ -485,6 +502,9 @@ function quarantinedStateFromAuthority(
     clientId: authority.clientId,
     resource: authority.resource,
     scopes: authority.scopes,
+    ...(authority.authorizationGeneration === undefined
+      ? {}
+      : { authorizationGeneration: authority.authorizationGeneration }),
     ...(authority.grantId === undefined
       ? {}
       : { grantId: authority.grantId }),
@@ -517,6 +537,7 @@ export class ConsentAuthorizationCodec {
     clientId: string,
     resource: string,
     claims: ReauthenticationBridgeClaims,
+    authorizationGeneration: string,
   ): Promise<ReauthenticationBridge> {
     if (
       !validAccountId(accountId) ||
@@ -524,18 +545,20 @@ export class ConsentAuthorizationCodec {
       resource !== this.expectedResource ||
       !proofPattern.test(claims.proof) ||
       claims.authorizationEpoch === "" ||
+      !digestPattern.test(authorizationGeneration) ||
       !Number.isSafeInteger(claims.expiresAt) ||
       claims.expiresAt < 1
     ) {
       throw new Error("invalid reauthentication bridge");
     }
-    const binding: ReauthenticationBridgeBindingV1 = {
-      version: 1,
+    const binding: ReauthenticationBridgeBindingV2 = {
+      version: 2,
       accountId,
       clientId,
       resource,
       proof: claims.proof,
       authorizationEpoch: claims.authorizationEpoch,
+      authorizationGeneration,
       expiresAt: claims.expiresAt,
     };
     const bindingEnvelope = await this.vault.seal(
@@ -581,12 +604,14 @@ export class ConsentAuthorizationCodec {
       }
       const binding = parsed as Record<string, unknown>;
       if (
-        binding.version !== 1 ||
+        binding.version !== 2 ||
         binding.accountId !== accountId ||
         binding.clientId !== clientId ||
         binding.resource !== resource ||
         binding.proof !== bridge.proof ||
         binding.authorizationEpoch !== bridge.authorizationEpoch ||
+        typeof binding.authorizationGeneration !== "string" ||
+        !digestPattern.test(binding.authorizationGeneration) ||
         binding.expiresAt !== bridge.expiresAt
       ) {
         throw new Error("invalid bridge");
@@ -596,6 +621,7 @@ export class ConsentAuthorizationCodec {
           .update(bridge.bindingEnvelope, "utf8")
           .digest("base64url"),
         authorizationEpoch: bridge.authorizationEpoch,
+        authorizationGeneration: binding.authorizationGeneration,
         expiresAt: bridge.expiresAt,
       };
     } catch {
@@ -720,6 +746,10 @@ export class ConsentAuthorizationCodec {
       );
     if (
       retiredReauthenticationBridges === null ||
+      (
+        state.authorizationGeneration !== undefined &&
+        !digestPattern.test(state.authorizationGeneration)
+      ) ||
       (state.lifecycle === "pending_reauth" &&
         parsePending(pending) === undefined) ||
       (state.lifecycle !== "pending_reauth" && pending !== undefined) ||
@@ -740,6 +770,9 @@ export class ConsentAuthorizationCodec {
       clientId: state.clientId,
       resource,
       scopes,
+      ...(state.authorizationGeneration === undefined
+        ? {}
+        : { authorizationGeneration: state.authorizationGeneration }),
       ...(state.grantId === undefined ? {} : { grantId: state.grantId }),
       sessionIds: [...new Set(state.sessionIds)],
       ...(pending === undefined ? {} : { pendingReauthentication: pending }),

@@ -82,6 +82,7 @@ describe("ConsentAuthorizationCodec", () => {
         authorizationEpoch: "authorization-epoch",
         expiresAt: 1_000,
       },
+      "g".repeat(43),
     );
 
     const first = await codec.verifyReauthenticationBridge(
@@ -99,8 +100,11 @@ describe("ConsentAuthorizationCodec", () => {
 
     expect(first).toEqual(second);
     expect(first.fingerprint).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+    expect(bridge).not.toHaveProperty("authorizationGeneration");
+    expect(bridge.bindingEnvelope).not.toContain("g".repeat(43));
     expect(first).toMatchObject({
       authorizationEpoch: "authorization-epoch",
+      authorizationGeneration: "g".repeat(43),
       expiresAt: 1_000,
     });
     await expect(

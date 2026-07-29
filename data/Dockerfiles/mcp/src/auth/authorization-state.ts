@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import type {
   Pool,
@@ -171,18 +171,117 @@ export class MariaDbConsentAuthorizationRepository {
       maximumRetiredReauthenticationBridges;
   }
 
-  issueReauthenticationBridge(
+  async issueReauthenticationBridge(
     accountId: string,
     clientId: string,
     resource: string,
     claims: ReauthenticationBridgeClaims,
   ): Promise<ReauthenticationBridge> {
-    return this.codec.issueReauthenticationBridge(
-      accountId,
-      clientId,
-      resource,
-      claims,
-    );
+    if (!validAccountId(accountId) || clientId === "" || resource === "") {
+      throw new InvalidReauthenticationProofError();
+    }
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const account =
+        await this.accountRepository.getAuthorizationEpochLocked(
+          connection,
+          accountId,
+        );
+      if (
+        account === null ||
+        account.authorizationEpoch !== claims.authorizationEpoch
+      ) {
+        throw new InvalidReauthenticationProofError();
+      }
+      const newAuthorizationGeneration =
+        randomBytes(32).toString("base64url");
+      await this.insertStateIfAbsent(
+        connection,
+        accountId,
+        {
+          lifecycle: "revoked",
+          clientId,
+          resource,
+          scopes: [],
+          authorizationGeneration: newAuthorizationGeneration,
+          sessionIds: [],
+          accountActive: !account.revoked,
+          retiredReauthenticationBridges: [],
+        },
+      );
+      let existing = await this.lockConsent(
+        connection,
+        accountId,
+        clientId,
+        !account.revoked,
+      );
+      if (existing === null) {
+        throw new InvalidReauthenticationProofError();
+      }
+      let authorizationGeneration = existing?.authorizationGeneration;
+      if (authorizationGeneration === undefined) {
+        authorizationGeneration = newAuthorizationGeneration;
+        if (existing?.lifecycle === "revoked") {
+          existing = {
+            ...existing,
+            scopes: [],
+            grantId: undefined,
+            sessionIds: [],
+            authorizationGeneration,
+          };
+        } else {
+          existing =
+            existing === null
+              ? {
+                  lifecycle: "revoked",
+                  clientId,
+                  resource,
+                  scopes: [],
+                  authorizationGeneration,
+                  sessionIds: [],
+                  accountActive: !account.revoked,
+                  retiredReauthenticationBridges: [],
+                }
+              : { ...existing, authorizationGeneration };
+        }
+        const pending =
+          existing.lifecycle === "pending_reauth" &&
+          existing.pendingBridgeFingerprint !== undefined &&
+          existing.pendingAuthorizationEpoch !== undefined &&
+          existing.pendingReauthentication !== undefined
+            ? {
+                bridgeFingerprint: existing.pendingBridgeFingerprint,
+                authorizationEpoch: existing.pendingAuthorizationEpoch,
+                sessionUid: existing.pendingReauthentication.sessionUid,
+                expiresAt: existing.pendingReauthentication.expiresAt,
+              }
+            : undefined;
+        await this.writeStateLocked(connection, accountId, existing, {
+          ...(pending === undefined ? {} : { pending }),
+          ...(existing.consumedProofDigest === undefined
+            ? {}
+            : { consumedProofDigest: existing.consumedProofDigest }),
+          ...(existing.quarantineEvidence === undefined
+            ? {}
+            : { evidence: existing.quarantineEvidence }),
+        });
+      }
+      const bridge = await this.codec.issueReauthenticationBridge(
+        accountId,
+        clientId,
+        resource,
+        claims,
+        authorizationGeneration,
+      );
+      await connection.commit();
+      return bridge;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   }
 
   private async verifiedBridge(
@@ -253,6 +352,24 @@ export class MariaDbConsentAuthorizationRepository {
          scopes = VALUES(scopes),
          revoked_at = IF(?, NULL, COALESCE(revoked_at, UTC_TIMESTAMP(6)))`,
       [accountId, state.clientId, value, active, active],
+    );
+  }
+
+  private async insertStateIfAbsent(
+    connection: PoolConnection,
+    accountId: string,
+    state: ConsentAuthorizationState,
+  ): Promise<void> {
+    const value = await this.codec.seal(accountId, state);
+    const active = state.lifecycle === "active";
+    await connection.execute(
+      `INSERT IGNORE INTO consents (
+         account_id, client_id, scopes, created_at, revoked_at
+       ) VALUES (
+         UNHEX(REPLACE(?, '-', '')), ?, ?, UTC_TIMESTAMP(6),
+         IF(?, NULL, UTC_TIMESTAMP(6))
+       )`,
+      [accountId, state.clientId, value, active],
     );
   }
 
@@ -365,6 +482,13 @@ export class MariaDbConsentAuthorizationRepository {
         clientId,
         !account.revoked,
       );
+      if (
+        existing === null ||
+        existing.authorizationGeneration !==
+          verifiedBridge.authorizationGeneration
+      ) {
+        throw new InvalidReauthenticationProofError();
+      }
       if (existing?.needsQuarantine === true) {
         const quarantined: ConsentAuthorizationState = {
           ...existing,
@@ -398,7 +522,12 @@ export class MariaDbConsentAuthorizationRepository {
       ) {
         throw new InvalidReauthenticationProofError();
       }
-      const sessionIds = [...(existing?.sessionIds ?? [])];
+      const liveAuthority =
+        existing.lifecycle === "active" ||
+        existing.lifecycle === "pending_reauth"
+          ? existing
+          : null;
+      const sessionIds = [...(liveAuthority?.sessionIds ?? [])];
       if (existing?.lifecycle === "pending_reauth") {
         if (
           existing.pendingBridgeFingerprint ===
@@ -451,10 +580,12 @@ export class MariaDbConsentAuthorizationRepository {
         lifecycle: "pending_reauth",
         clientId,
         resource,
-        scopes: existing?.scopes ?? [],
-        ...(existing?.grantId === undefined
+        scopes: liveAuthority?.scopes ?? [],
+        authorizationGeneration:
+          verifiedBridge.authorizationGeneration,
+        ...(liveAuthority?.grantId === undefined
           ? {}
-          : { grantId: existing.grantId }),
+          : { grantId: liveAuthority.grantId }),
         sessionIds,
         accountActive: !account.revoked,
         pendingReauthentication: {
@@ -518,6 +649,8 @@ export class MariaDbConsentAuthorizationRepository {
         existing === null ||
         existing.needsQuarantine === true ||
         existing.lifecycle !== "pending_reauth" ||
+        existing.authorizationGeneration !==
+          verifiedBridge.authorizationGeneration ||
         existing.pendingBridgeFingerprint !==
           verifiedBridge.fingerprint ||
         existing.pendingAuthorizationEpoch !==
@@ -557,6 +690,8 @@ export class MariaDbConsentAuthorizationRepository {
         clientId,
         resource,
         scopes: [...state.scopes],
+        authorizationGeneration:
+          existing.authorizationGeneration,
         grantId: state.grantId,
         sessionIds,
         accountActive: true,
@@ -628,6 +763,8 @@ export class MariaDbConsentAuthorizationRepository {
           clientId,
           resource,
           scopes: [...state.scopes],
+          authorizationGeneration:
+            existing.authorizationGeneration,
           grantId: state.grantId,
           sessionIds,
           accountActive: true,
@@ -1007,13 +1144,83 @@ export class MariaDbConsentAuthorizationRepository {
         lifecycle: "revoked",
         clientId,
         resource: existing.resource,
-        scopes: existing.scopes,
+        scopes: [],
+        authorizationGeneration: randomBytes(32).toString("base64url"),
         sessionIds: [],
         accountActive: existing.accountActive,
         retiredReauthenticationBridges:
           existing.retiredReauthenticationBridges ?? [],
       });
       await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async revokeMatchingGrant(
+    accountId: string,
+    clientId: string,
+    resource: string,
+    grantId: string,
+  ): Promise<readonly string[]> {
+    if (
+      !validAccountId(accountId) ||
+      clientId === "" ||
+      resource === "" ||
+      grantId === ""
+    ) {
+      return [];
+    }
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      if (!(await this.lockAccountRow(connection, accountId))) {
+        await connection.commit();
+        return [];
+      }
+      const existing = await this.lockConsent(
+        connection,
+        accountId,
+        clientId,
+        false,
+      );
+      if (
+        existing === null ||
+        existing.needsQuarantine === true ||
+        existing.resource !== resource ||
+        existing.grantId !== grantId ||
+        (
+          existing.lifecycle !== "active" &&
+          existing.lifecycle !== "pending_reauth"
+        )
+      ) {
+        await connection.commit();
+        return [];
+      }
+      const sessionIds = [
+        ...new Set([
+          ...existing.sessionIds,
+          ...(existing.pendingReauthentication === undefined
+            ? []
+            : [existing.pendingReauthentication.sessionUid]),
+        ]),
+      ];
+      await this.writeStateLocked(connection, accountId, {
+        lifecycle: "revoked",
+        clientId,
+        resource,
+        scopes: [],
+        authorizationGeneration: randomBytes(32).toString("base64url"),
+        sessionIds: [],
+        accountActive: existing.accountActive,
+        retiredReauthenticationBridges:
+          existing.retiredReauthenticationBridges ?? [],
+      });
+      await connection.commit();
+      return sessionIds;
     } catch (error) {
       await connection.rollback();
       throw error;
