@@ -620,6 +620,16 @@ describe("mailcow authorization lifecycle", () => {
       consentRepository.retainCleanupFinalizer(
         verified.accountId,
         clientId,
+        "https://other.example.test/mcp",
+        "fresh-session-one",
+        undefined,
+        102,
+      ),
+    ).rejects.toThrow("reauthentication proof is invalid");
+    await expect(
+      consentRepository.retainCleanupFinalizer(
+        verified.accountId,
+        clientId,
         resource.href,
         "fresh-session-two",
         bridge,

@@ -908,6 +908,7 @@ export class MariaDbConsentAuthorizationRepository {
       );
       if (
         existing === null ||
+        existing.resource !== resource ||
         existing.needsQuarantine === true ||
         (
           existing.lifecycle !== "cleanup_pending" &&
