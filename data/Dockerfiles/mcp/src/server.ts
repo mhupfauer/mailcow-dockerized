@@ -106,6 +106,7 @@ export async function startProductionServer(
         return true;
       },
       resourceMetadataUrl: config.resourceMetadataUrl,
+      resource: config.resource,
       oidcProvider,
       registrationsPerHour: config.registrationsPerHour,
       interactions: {

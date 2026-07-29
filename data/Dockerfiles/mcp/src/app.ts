@@ -9,10 +9,14 @@ import {
   createInteractionRouter,
   type InteractionDependencies,
 } from "./auth/interactions.js";
+import { AccessTokenVerifier } from "./auth/token-verifier.js";
 import { createIpRateLimiter } from "./http/rate-limit.js";
+import { createMcpMetadataRouter } from "./http/metadata.js";
+import { createMcpTransportRouter } from "./mcp/transport.js";
 
 interface AppDependencies {
   readiness(): Promise<boolean>;
+  resource?: URL;
   resourceMetadataUrl: URL;
   oidcProvider?: Provider;
   registrationsPerHour?: number;
@@ -38,13 +42,33 @@ export function createApp(deps: AppDependencies): Express {
     }
   });
 
-  app.post("/mcp", (_request, response) => {
-    response.set(
-      "WWW-Authenticate",
-      `Bearer resource_metadata="${deps.resourceMetadataUrl.href}"`,
+  if (deps.oidcProvider !== undefined && deps.resource !== undefined) {
+    app.use(
+      createMcpMetadataRouter({
+        issuer: new URL(deps.oidcProvider.issuer),
+        resource: deps.resource,
+      }),
     );
-    response.sendStatus(401);
-  });
+    app.all(
+      "/mcp",
+      express.json({ strict: true }),
+      ...createMcpTransportRouter({
+        verifier: new AccessTokenVerifier({
+          provider: deps.oidcProvider,
+          resource: deps.resource,
+        }),
+        resourceMetadataUrl: deps.resourceMetadataUrl,
+      }),
+    );
+  } else {
+    app.post("/mcp", (_request, response) => {
+      response.set(
+        "WWW-Authenticate",
+        `Bearer resource_metadata="${deps.resourceMetadataUrl.href}"`,
+      );
+      response.sendStatus(401);
+    });
+  }
 
   if (deps.oidcProvider !== undefined) {
     deps.oidcProvider.proxy = true;

@@ -300,6 +300,7 @@ export async function startApp(
   const app = createApp({
     readiness: async () => true,
     resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource/mcp", issuer),
+    resource,
     oidcProvider: provider,
     interactions: {
       accountRepository,
