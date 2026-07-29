@@ -292,6 +292,9 @@ mcp_rollback_transaction() {
 
 mcp_verify_https() {
   local hostname
+  local activation_local_verify
+  local https_port=443
+  local -a curl_connection_options=()
   local issuer
   local resource
   local authorization_body
@@ -306,6 +309,24 @@ mcp_verify_https() {
     echo "MAILCOW_HOSTNAME must be set exactly once" >&2
     return 1
   }
+  activation_local_verify="$(
+    mcp_config_value "${MAILCOW_CONF}" MCP_ACTIVATION_LOCAL_VERIFY
+  )" || {
+    echo "MCP_ACTIVATION_LOCAL_VERIFY must be set exactly once" >&2
+    return 1
+  }
+  if [[ "${activation_local_verify}" == 1 ]]; then
+    if mcp_config_has_key "${MAILCOW_CONF}" HTTPS_PORT; then
+      https_port="$(mcp_config_value "${MAILCOW_CONF}" HTTPS_PORT)" || {
+        echo "HTTPS_PORT must be set at most once for MCP local activation verification" >&2
+        return 1
+      }
+    fi
+    curl_connection_options=(
+      --insecure
+      --connect-to "${hostname}:443:127.0.0.1:${https_port}"
+    )
+  fi
   command -v jq >/dev/null 2>&1 || {
     echo "jq is required to validate MCP discovery metadata" >&2
     return 1
@@ -331,6 +352,7 @@ mcp_verify_https() {
     challenge=
 
     status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+      ${curl_connection_options[@]+"${curl_connection_options[@]}"} \
       --output "${authorization_body}" --write-out '%{http_code}' \
       "${issuer}/.well-known/oauth-authorization-server")" || status=000
     if [[ "${status}" == 200 ]] &&
@@ -338,6 +360,7 @@ mcp_verify_https() {
         'type == "object" and .issuer == $issuer' \
         "${authorization_body}" >/dev/null; then
       status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+        ${curl_connection_options[@]+"${curl_connection_options[@]}"} \
         --output "${protected_body}" --write-out '%{http_code}' \
         "${issuer}/.well-known/oauth-protected-resource/mcp")" || status=000
       if [[ "${status}" == 200 ]] &&
@@ -346,6 +369,7 @@ mcp_verify_https() {
            (.authorization_servers | type == "array" and index($issuer) != null)' \
           "${protected_body}" >/dev/null; then
         status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+          ${curl_connection_options[@]+"${curl_connection_options[@]}"} \
           --dump-header "${response_headers}" --output /dev/null \
           --write-out '%{http_code}' -X POST "${resource}")" || status=000
         if [[ "${status}" == 401 ]]; then

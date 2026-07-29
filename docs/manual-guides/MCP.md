@@ -55,6 +55,22 @@ initializer, MCP database, attachment volume, generated secrets, and OAuth
 state; re-enabling is therefore reversible. `retry` is the focused recovery
 command after an MCP activation or update failure.
 
+### Readiness verification behind a load balancer
+
+The activation check uses the public Mailcow HTTPS address by default. If the
+Mailcow host cannot hairpin through its load balancer, set this in
+`mailcow.conf` before running `enable` or `retry`:
+
+```dotenv
+MCP_ACTIVATION_LOCAL_VERIFY=1
+```
+
+In this mode the helper keeps the public hostname and MCP URLs but connects to
+`127.0.0.1:${HTTPS_PORT:-443}` and accepts the local Mailcow certificate. This
+checks local nginx routing and the MCP discovery/authentication contract; it
+does not validate load-balancer health or public certificate trust. MCP client
+traffic still uses the public endpoint.
+
 ## Destructive cleanup
 
 Use purge only when MCP is disabled and permanent removal is intended:

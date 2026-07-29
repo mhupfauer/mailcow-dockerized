@@ -55,8 +55,26 @@ MCP_RECIPIENTS_PER_HOUR=100
 MCP_CONCURRENT_UPLOADS=5
 MCP_AUDIT_RETENTION_DAYS=30
 MCP_CONFIG_VERSION=1
+MCP_ACTIVATION_LOCAL_VERIFY=0
 EOF
   chmod 600 "${path}"
+}
+
+set_config_value() {
+  local path="$1"
+  local key="$2"
+  local value="$3"
+  local next="${path}.next"
+
+  awk -F= -v key="${key}" -v value="${value}" '
+    $1 == key { print key "=" value; matches++; next }
+    { print }
+    END { if (matches != 1) exit 1 }
+  ' "${path}" > "${next}" || {
+    rm -f -- "${next}"
+    return 1
+  }
+  mv "${next}" "${path}"
 }
 
 make_case() {
@@ -679,6 +697,67 @@ test_https_verification_retries_and_validates_metadata() {
       fail "persistent invalid ${invalid} did not exhaust bounded full-contract attempts"
   done
   pass "HTTPS verification retries and validates discovery URLs and challenge"
+}
+
+test_https_verification_supports_local_backend_mode() {
+  local case_dir
+  local curl_count
+
+  case_dir="$(make_case strict-readiness)"
+  run_mcp "${case_dir}" enable >/dev/null
+  if grep '^curl ' "${case_dir}/calls.log" |
+    grep -Eq -- '--insecure|--connect-to'; then
+    fail "strict readiness weakened TLS or bypassed the public destination"
+  fi
+
+  case_dir="$(make_case local-readiness-default-port)"
+  set_config_value "${case_dir}/mailcow.conf" MCP_ACTIVATION_LOCAL_VERIFY 1
+  run_mcp "${case_dir}" enable >/dev/null
+  curl_count="$(grep -c '^curl ' "${case_dir}/calls.log")"
+  test "${curl_count}" = 3 ||
+    fail "local readiness did not execute the complete contract"
+  test "$(grep -c -- '--insecure' "${case_dir}/calls.log")" = 3 ||
+    fail "local readiness did not allow the backend certificate on every request"
+  test "$(grep -c -- \
+    '--connect-to mail.example.test:443:127.0.0.1:443' \
+    "${case_dir}/calls.log")" = 3 ||
+    fail "local readiness did not default to the loopback HTTPS port"
+  test "$(grep -c 'https://mail.example.test' "${case_dir}/calls.log")" = 3 ||
+    fail "local readiness changed a public request URL"
+
+  case_dir="$(make_case local-readiness-custom-port)"
+  set_config_value "${case_dir}/mailcow.conf" MCP_ACTIVATION_LOCAL_VERIFY 1
+  printf 'HTTPS_PORT=8443\n' >> "${case_dir}/mailcow.conf"
+  run_mcp "${case_dir}" enable >/dev/null
+  test "$(grep -c -- \
+    '--connect-to mail.example.test:443:127.0.0.1:8443' \
+    "${case_dir}/calls.log")" = 3 ||
+    fail "local readiness ignored the configured HTTPS port"
+
+  pass "HTTPS verification supports a fixed local backend mode"
+}
+
+test_invalid_local_probe_config_aborts_before_activation() {
+  local case_dir
+
+  case_dir="$(make_case invalid-local-readiness)"
+  set_config_value "${case_dir}/mailcow.conf" MCP_ACTIVATION_LOCAL_VERIFY 1
+  printf 'HTTPS_PORT=70000\n' >> "${case_dir}/mailcow.conf"
+  cp "${case_dir}/mailcow.conf" "${case_dir}/before.conf"
+
+  if run_mcp "${case_dir}" enable >/dev/null 2>&1; then
+    fail "enable accepted an invalid local readiness HTTPS port"
+  fi
+  assert_file_equals "${case_dir}/before.conf" "${case_dir}/mailcow.conf" \
+    "invalid local readiness configuration was not restored exactly"
+  if grep -qx 'config' "${case_dir}/stages.log" 2>/dev/null; then
+    fail "invalid local readiness configuration reached activation"
+  fi
+  if grep -q '^curl ' "${case_dir}/calls.log" 2>/dev/null; then
+    fail "invalid local readiness configuration reached an HTTPS probe"
+  fi
+
+  pass "invalid local probe configuration aborts before activation"
 }
 
 test_disable_is_idempotent_and_preserves_data_configuration() {
@@ -1314,6 +1393,11 @@ if [[ "${MCP_TEST_FOCUS:-}" == compose ]]; then
   test_compose_forwards_mcp_oauth_policy_overrides
   exit 0
 fi
+if [[ "${MCP_TEST_FOCUS:-}" == local-probe ]]; then
+  test_https_verification_supports_local_backend_mode
+  test_invalid_local_probe_config_aborts_before_activation
+  exit 0
+fi
 
 test_compose_forwards_mcp_oauth_policy_overrides
 test_mcp_image_release_policy
@@ -1328,6 +1412,8 @@ test_term_during_rollback_cleanup_finishes_rollback
 test_term_during_rollback_setup_cannot_bypass_rollback
 test_rollback_reports_inventory_and_removal_failures
 test_https_verification_retries_and_validates_metadata
+test_https_verification_supports_local_backend_mode
+test_invalid_local_probe_config_aborts_before_activation
 test_disable_is_idempotent_and_preserves_data_configuration
 test_status_retry_and_purge_guards
 test_inherited_profile_is_not_forwarded_to_compose
