@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { describe, expect, test } from "vitest";
 
 import {
+  app,
   client,
   hidden,
   HttpClient,
@@ -15,7 +16,9 @@ import {
   reachConsentFor,
   redirectUri,
   resource,
+  restartProviderAndApp,
   server,
+  startApp,
 } from "./support/interactions-fixture.js";
 
 const protocolVersion = "2025-11-25";
@@ -37,7 +40,7 @@ async function issueAccessToken(
   httpClient: HttpClient,
   scope: string,
   mailbox = "user@example.test",
-): Promise<{ accessToken: string; clientId: string }> {
+): Promise<{ accessToken: string; refreshToken: string; clientId: string }> {
   const registration = await httpClient.postJson("/oauth/reg", {
     redirect_uris: [redirectUri],
     grant_types: ["authorization_code"],
@@ -77,7 +80,30 @@ async function issueAccessToken(
   expect(token.status).toBe(200);
   const body = token.json() as Record<string, unknown>;
   expect(body.access_token).toBeTypeOf("string");
-  return { accessToken: body.access_token as string, clientId };
+  expect(body.refresh_token).toBeTypeOf("string");
+  return {
+    accessToken: body.access_token as string,
+    refreshToken: body.refresh_token as string,
+    clientId,
+  };
+}
+
+async function mcpRequest(
+  method: "POST" | "GET" | "DELETE",
+  bearer: string | undefined,
+  body?: unknown,
+  headers: Record<string, string> = {},
+) {
+  return client.request("/mcp", {
+    method,
+    headers: {
+      accept: "application/json, text/event-stream",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(bearer === undefined ? {} : { authorization: `Bearer ${bearer}` }),
+      ...headers,
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
 }
 
 async function mcpPost(
@@ -85,16 +111,28 @@ async function mcpPost(
   body: unknown,
   headers: Record<string, string> = {},
 ) {
-  return client.request("/mcp", {
-    method: "POST",
-    headers: {
-      accept: "application/json, text/event-stream",
-      "content-type": "application/json",
-      ...(bearer === undefined ? {} : { authorization: `Bearer ${bearer}` }),
-      ...headers,
-    },
-    body: JSON.stringify(body),
+  return mcpRequest("POST", bearer, body, headers);
+}
+
+async function mintAccessToken(
+  accessToken: string,
+  clientId: string,
+  expiresInSeconds: number,
+): Promise<string> {
+  const original = await provider.AccessToken.find(accessToken);
+  const oidcClient = await provider.Client.find(clientId);
+  expect(original).toBeDefined();
+  expect(oidcClient).toBeDefined();
+  const minted = new provider.AccessToken({
+    client: oidcClient!,
+    accountId: original!.accountId,
+    aud: resource.href,
+    scope: original!.scope ?? "mail.read",
+    grantId: original!.grantId,
+    gty: original!.gty,
   });
+  minted.exp = Math.floor(Date.now() / 1_000) + expiresInSeconds;
+  return minted.save(expiresInSeconds);
 }
 
 describe("protected MCP Streamable HTTP", () => {
@@ -123,6 +161,43 @@ describe("protected MCP Streamable HTTP", () => {
       'resource_metadata="https://mail.example.test/.well-known/oauth-protected-resource/mcp"',
     );
   });
+
+  test.each([
+    ["malformed", "{"],
+    ["oversized", JSON.stringify({ value: "x".repeat(110_000) })],
+  ])(
+    "authenticates before parsing an unauthenticated %s JSON body",
+    async (_caseName, body) => {
+      const response = await client.request("/mcp", {
+        method: "POST",
+        headers: {
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+        },
+        body,
+      });
+
+      expect(response.status).toBe(401);
+      expect(response.headers["www-authenticate"]).toContain(
+        'resource_metadata="https://mail.example.test/.well-known/oauth-protected-resource/mcp"',
+      );
+      expect(response.json()).toMatchObject({ error: "invalid_token" });
+    },
+  );
+
+  test.each(["GET", "DELETE"] as const)(
+    "requires bearer authentication on %s",
+    async (method) => {
+      const response = await mcpRequest(method, undefined, undefined, {
+        "mcp-session-id": "fabricated-session-id",
+      });
+
+      expect(response.status).toBe(401);
+      expect(response.headers["www-authenticate"]).toContain(
+        'resource_metadata="https://mail.example.test/.well-known/oauth-protected-resource/mcp"',
+      );
+    },
+  );
 
   test("rejects an expired opaque bearer token", async () => {
     const issued = await issueAccessToken(client, "mail.read");
@@ -179,6 +254,7 @@ describe("protected MCP Streamable HTTP", () => {
     expect(response.body).toContain('"protocolVersion":"2025-11-25"');
     expect(response.body).not.toContain("user@example.test");
     expect(issued.accessToken).not.toContain("user@example.test");
+    expect(issued.accessToken).not.toContain("app-password");
     expect(response.body).not.toContain("app-password");
 
     const tools = await mcpPost(issued.accessToken, {
@@ -192,6 +268,136 @@ describe("protected MCP Streamable HTTP", () => {
     });
     expect(tools.status).toBe(200);
     expect(tools.body).toContain('"tools":[]');
+  });
+
+  test("terminates a session through authenticated DELETE", async () => {
+    const issued = await issueAccessToken(client, "mail.read");
+    const initialized = await mcpPost(
+      issued.accessToken,
+      initializeRequest(),
+    );
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+    const sessionHeaders = {
+      "mcp-session-id": sessionId,
+      "mcp-protocol-version": protocolVersion,
+    };
+
+    const deleted = await mcpRequest(
+      "DELETE",
+      issued.accessToken,
+      undefined,
+      sessionHeaders,
+    );
+    expect(deleted.status).toBe(200);
+
+    const afterDelete = await mcpPost(
+      issued.accessToken,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      sessionHeaders,
+    );
+    expect(afterDelete.status).toBe(404);
+  });
+
+  test("closes all sessions through the application lifecycle", async () => {
+    const issued = await issueAccessToken(client, "mail.read");
+    const initialized = await mcpPost(
+      issued.accessToken,
+      initializeRequest(),
+    );
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await (
+      app as typeof app & { closeMcpSessions(): Promise<void> }
+    ).closeMcpSessions();
+
+    const response = await mcpPost(
+      issued.accessToken,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": protocolVersion,
+      },
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test("synchronously closes a session at its original token expiry", async () => {
+    let now = Date.now();
+    await startApp({ mcpNow: () => now });
+    const original = await issueAccessToken(client, "mail.read");
+    const originalModel = await provider.AccessToken.find(original.accessToken);
+    expect(originalModel?.exp).toBeTypeOf("number");
+    const replacement = await mintAccessToken(
+      original.accessToken,
+      original.clientId,
+      3_600,
+    );
+    const initialized = await mcpPost(
+      original.accessToken,
+      initializeRequest(),
+    );
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+    now = originalModel!.exp * 1_000;
+
+    const response = await mcpPost(
+      replacement,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": protocolVersion,
+      },
+    );
+
+    expect(response.status).toBe(404);
+  });
+
+  test("synchronously closes a session after 30 minutes of inactivity", async () => {
+    let now = Date.now();
+    await startApp({ mcpNow: () => now });
+    const issued = await issueAccessToken(client, "mail.read");
+    const longLived = await mintAccessToken(
+      issued.accessToken,
+      issued.clientId,
+      3_600,
+    );
+    const longLivedModel = await provider.AccessToken.find(longLived);
+    expect(longLivedModel!.exp * 1_000).toBeGreaterThan(
+      now + 30 * 60 * 1_000,
+    );
+    const initialized = await mcpPost(longLived, initializeRequest());
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+    now += 30 * 60 * 1_000;
+
+    const response = await mcpPost(
+      longLived,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": protocolVersion,
+      },
+    );
+
+    expect(response.status).toBe(404);
   });
 
   test("terminates a session when a different account tries to use it", async () => {
@@ -228,5 +434,79 @@ describe("protected MCP Streamable HTTP", () => {
       "mcp-protocol-version": protocolVersion,
     });
     expect(terminated.status).toBe(404);
+  });
+
+  test("terminates a session when a different client for the same account uses it", async () => {
+    const account = await issueAccessToken(client, "mail.read");
+    const accountToken = await provider.AccessToken.find(account.accessToken);
+    expect(accountToken).toBeDefined();
+    const initialized = await mcpPost(
+      account.accessToken,
+      initializeRequest(),
+    );
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    const secondClientRegistration = await client.postJson("/oauth/reg", {
+      redirect_uris: [redirectUri],
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    });
+    const secondClientId = (
+      secondClientRegistration.json() as Record<string, unknown>
+    ).client_id as string;
+    const secondClient = await provider.Client.find(secondClientId);
+    expect(secondClient).toBeDefined();
+    const secondClientToken = await new provider.AccessToken({
+      client: secondClient!,
+      accountId: accountToken!.accountId,
+      aud: resource.href,
+      scope: "mail.read",
+      grantId: accountToken!.grantId,
+      gty: accountToken!.gty,
+    }).save(900);
+
+    const response = await mcpPost(
+      secondClientToken,
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {},
+      },
+      {
+        "mcp-session-id": sessionId,
+        "mcp-protocol-version": protocolVersion,
+      },
+    );
+    expect(response.status).toBe(403);
+  });
+
+  test("refreshes the same grant after provider and application restart", async () => {
+    const issued = await issueAccessToken(client, "mail.read");
+    const original = await provider.AccessToken.find(issued.accessToken);
+    expect(original?.grantId).toBeTypeOf("string");
+
+    await restartProviderAndApp();
+    const refreshed = await client.postForm("/oauth/token", {
+      grant_type: "refresh_token",
+      client_id: issued.clientId,
+      refresh_token: issued.refreshToken,
+      resource: resource.href,
+    });
+    expect(refreshed.status).toBe(200);
+    const refreshedBody = refreshed.json() as Record<string, unknown>;
+    expect(refreshedBody.access_token).toBeTypeOf("string");
+    const refreshedModel = await provider.AccessToken.find(
+      refreshedBody.access_token as string,
+    );
+    expect(refreshedModel?.grantId).toBe(original!.grantId);
+
+    const initialized = await mcpPost(
+      refreshedBody.access_token as string,
+      initializeRequest(),
+    );
+    expect(initialized.status).toBe(200);
+    expect(initialized.headers["mcp-session-id"]).toBeTypeOf("string");
   });
 });

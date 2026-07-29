@@ -189,6 +189,7 @@ export let pool: Pool;
 export let provider: Provider;
 export let client: HttpClient;
 export let server: ReturnType<ReturnType<typeof createApp>["listen"]>;
+export let app: ReturnType<typeof createApp>;
 export let accountRepository: MariaDbAccountRepository;
 export let authorityMutations: BoundedAuthorizationMutationCoordinator;
 let container: StartedTestContainer;
@@ -264,6 +265,7 @@ export function installInteractionsFixture(): void {
   });
 
   afterEach(async () => {
+    await app.closeMcpSessions();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
@@ -283,9 +285,11 @@ export async function startApp(
     reauthenticationProofTtlMs?: number;
     proofNow?: () => number;
     verificationTimeoutMs?: number;
+    mcpNow?: () => number;
   } = {},
 ): Promise<void> {
   if (server?.listening) {
+    await app.closeMcpSessions();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
@@ -294,14 +298,16 @@ export async function startApp(
     maximumAuthorityMutations = 1_000,
     reauthenticationProofTtlMs = 10 * 60 * 1_000,
     proofNow,
+    mcpNow,
     ...interactionOverrides
   } = overrides;
   authorityMutations = new BoundedAuthorizationMutationCoordinator(maximumAuthorityMutations);
-  const app = createApp({
+  app = createApp({
     readiness: async () => true,
     resourceMetadataUrl: new URL("/.well-known/oauth-protected-resource/mcp", issuer),
     resource,
     oidcProvider: provider,
+    ...(mcpNow === undefined ? {} : { mcpNow }),
     interactions: {
       accountRepository,
       credentialVerifier,
@@ -320,6 +326,13 @@ export async function startApp(
   server = app.listen(0);
   await new Promise<void>((resolve) => server.once("listening", resolve));
   client = new HttpClient((server.address() as AddressInfo).port);
+}
+
+export async function restartProviderAndApp(
+  overrides: Parameters<typeof startApp>[0] = {},
+): Promise<void> {
+  provider = await createOidcProvider({ pool, issuer, resource, encryptionKey });
+  await startApp(overrides);
 }
 
 export async function registerClient(): Promise<string> {

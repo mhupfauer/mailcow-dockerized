@@ -15,6 +15,7 @@ interface Session {
   accountId: string;
   clientId: string;
   expiresAt: number;
+  lastActivityAt: number;
   server: ReturnType<typeof createMcpServer>;
   transport: StreamableHTTPServerTransport;
   inactivityTimer: NodeJS.Timeout;
@@ -24,6 +25,13 @@ interface Session {
 interface McpTransportDependencies {
   verifier: OAuthTokenVerifier;
   resourceMetadataUrl: URL;
+  now?: () => number;
+}
+
+export interface McpTransportController {
+  authenticate: RequestHandler;
+  handle: RequestHandler;
+  closeAllSessions(): Promise<void>;
 }
 
 function isInitializeRequest(body: unknown): boolean {
@@ -35,10 +43,11 @@ function isInitializeRequest(body: unknown): boolean {
   );
 }
 
-export function createMcpTransportRouter({
+export function createMcpTransportController({
   verifier,
   resourceMetadataUrl,
-}: McpTransportDependencies): RequestHandler[] {
+  now = Date.now,
+}: McpTransportDependencies): McpTransportController {
   const sessions = new Map<string, Session>();
 
   const closeSession = async (sessionId: string): Promise<void> => {
@@ -57,6 +66,10 @@ export function createMcpTransportRouter({
     session.inactivityTimer = setTimeout(() => {
       void closeSession(sessionId);
     }, sessionInactivityMs);
+  };
+
+  const closeAllSessions = async (): Promise<void> => {
+    await Promise.all([...sessions.keys()].map(closeSession));
   };
 
   const authenticate = requireBearerAuth({
@@ -87,6 +100,15 @@ export function createMcpTransportRouter({
         response.status(404).json({ error: "session_not_found" });
         return;
       }
+      const requestTime = now();
+      if (
+        requestTime >= session.expiresAt * 1_000 ||
+        requestTime - session.lastActivityAt >= sessionInactivityMs
+      ) {
+        await closeSession(sessionId);
+        response.status(404).json({ error: "session_not_found" });
+        return;
+      }
       if (
         session.accountId !== account.accountId ||
         session.clientId !== account.clientId
@@ -95,6 +117,7 @@ export function createMcpTransportRouter({
         response.status(403).json({ error: "session_forbidden" });
         return;
       }
+      session.lastActivityAt = requestTime;
       resetInactivity(sessionId, session);
       await session.transport.handleRequest(request, response, request.body);
       return;
@@ -111,12 +134,16 @@ export function createMcpTransportRouter({
       enableJsonResponse: true,
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (newSessionId) => {
-        const now = Date.now();
-        const expiresInMs = Math.max(0, authInfo.expiresAt! * 1_000 - now);
+        const initializedAt = now();
+        const expiresInMs = Math.max(
+          0,
+          authInfo.expiresAt! * 1_000 - initializedAt,
+        );
         const session: Session = {
           accountId: account.accountId,
           clientId: account.clientId,
           expiresAt: authInfo.expiresAt!,
+          lastActivityAt: initializedAt,
           server,
           transport,
           inactivityTimer: setTimeout(() => {
@@ -146,5 +173,5 @@ export function createMcpTransportRouter({
     await transport.handleRequest(request, response, request.body);
   };
 
-  return [authenticate, handle];
+  return { authenticate, handle, closeAllSessions };
 }

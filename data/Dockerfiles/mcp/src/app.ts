@@ -12,7 +12,7 @@ import {
 import { AccessTokenVerifier } from "./auth/token-verifier.js";
 import { createIpRateLimiter } from "./http/rate-limit.js";
 import { createMcpMetadataRouter } from "./http/metadata.js";
-import { createMcpTransportRouter } from "./mcp/transport.js";
+import { createMcpTransportController } from "./mcp/transport.js";
 
 interface AppDependencies {
   readiness(): Promise<boolean>;
@@ -21,13 +21,19 @@ interface AppDependencies {
   oidcProvider?: Provider;
   registrationsPerHour?: number;
   interactions?: Omit<InteractionDependencies, "provider">;
+  mcpNow?: () => number;
+}
+
+export interface MailcowMcpApp extends Express {
+  closeMcpSessions(): Promise<void>;
 }
 
 const registrationPath = "/oauth/reg";
 const registrationWindowMs = 60 * 60 * 1_000;
 
-export function createApp(deps: AppDependencies): Express {
-  const app = express();
+export function createApp(deps: AppDependencies): MailcowMcpApp {
+  const app = express() as MailcowMcpApp;
+  app.closeMcpSessions = async () => {};
   app.set("trust proxy", 1);
 
   app.get("/health/live", (_request, response) => {
@@ -49,16 +55,20 @@ export function createApp(deps: AppDependencies): Express {
         resource: deps.resource,
       }),
     );
+    const mcp = createMcpTransportController({
+      verifier: new AccessTokenVerifier({
+        provider: deps.oidcProvider,
+        resource: deps.resource,
+      }),
+      resourceMetadataUrl: deps.resourceMetadataUrl,
+      ...(deps.mcpNow === undefined ? {} : { now: deps.mcpNow }),
+    });
+    app.closeMcpSessions = mcp.closeAllSessions;
     app.all(
       "/mcp",
+      mcp.authenticate,
       express.json({ strict: true }),
-      ...createMcpTransportRouter({
-        verifier: new AccessTokenVerifier({
-          provider: deps.oidcProvider,
-          resource: deps.resource,
-        }),
-        resourceMetadataUrl: deps.resourceMetadataUrl,
-      }),
+      mcp.handle,
     );
   } else {
     app.post("/mcp", (_request, response) => {

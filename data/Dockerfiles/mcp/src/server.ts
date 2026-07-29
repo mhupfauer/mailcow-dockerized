@@ -48,21 +48,38 @@ function closeServer(server: Server): Promise<void> {
   });
 }
 
-function createClose(server: Server, pool: Pool): () => Promise<void> {
+function createClose(
+  app: ReturnType<typeof createApp>,
+  server: Server,
+  pool: Pool,
+): () => Promise<void> {
   let closing: Promise<void> | undefined;
 
   return () => {
     closing ??= (async () => {
-      let serverError: Error | undefined;
+      let closeError: Error | undefined;
+      try {
+        await app.closeMcpSessions();
+      } catch (error) {
+        closeError =
+          error instanceof Error
+            ? error
+            : new Error("MCP session close failed");
+      }
       try {
         await closeServer(server);
       } catch (error) {
-        serverError =
+        closeError ??=
           error instanceof Error ? error : new Error("server close failed");
       }
-      await pool.end();
-      if (serverError !== undefined) {
-        throw serverError;
+      try {
+        await pool.end();
+      } catch (error) {
+        closeError ??=
+          error instanceof Error ? error : new Error("pool close failed");
+      }
+      if (closeError !== undefined) {
+        throw closeError;
       }
     })();
     return closing;
@@ -125,7 +142,7 @@ export async function startProductionServer(
 
     return {
       server,
-      close: createClose(server, pool),
+      close: createClose(app, server, pool),
     };
   } catch (error) {
     await pool.end();
