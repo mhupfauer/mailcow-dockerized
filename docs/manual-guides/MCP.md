@@ -44,7 +44,7 @@ method your installation normally uses):
 profile token is enabled or disabled. It is not a live health or service-state
 probe.
 `enable` validates the configuration, records a backup, adds only the `mcp`
-profile token, pulls the pinned `ghcr.io/mailcow/mcp:0.1.0` image, initializes
+profile token, pulls the pinned `ghcr.io/mhupfauer/mcp:0.1.0` image, initializes
 the dedicated database, starts the service, and verifies its public metadata.
 If activation fails, it restores the previous profile configuration and nginx
 state so the regular mailcow services remain independent.
@@ -70,9 +70,13 @@ credentials.
 
 ## Image release
 
-The implementation workflow publishes only when the exact Git tag
-`mcp-v0.1.0` is pushed. It is configured to build the pinned
-`ghcr.io/mailcow/mcp:0.1.0` image for `linux/amd64` and `linux/arm64` with
-provenance and an SBOM. Publishing that tag requires a maintainer with GHCR
-write authority; until then, this document describes implementation behavior,
-not an already-published image or deployed service.
+The release workflow publishes when a Git tag matching `mcp-v*` is pushed; the
+version is taken from the tag, so `mcp-v0.1.0` publishes
+`ghcr.io/<repository-owner>/mcp:0.1.0` for `linux/amd64` with provenance and an
+SBOM. On this fork that resolves to `ghcr.io/mhupfauer/mcp:0.1.0`, matching the
+pin in `docker-compose.yml`.
+
+The MCP image is also built and pushed by the regular image build workflow on
+every push to `master`, `staging`, and `feature/**`, alongside the other mailcow
+images. Packages created by `GITHUB_TOKEN` are private by default, so a host
+pulling them needs registry credentials unless the package is made public.

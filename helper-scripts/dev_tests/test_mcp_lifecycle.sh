@@ -1279,20 +1279,25 @@ if (
 }
 
 test_mcp_image_release_policy() {
-  grep -q 'ghcr.io/mailcow/mcp:0.1.0' "${REPO_DIR}/docker-compose.yml" ||
+  grep -qE 'ghcr\.io/[^/]+/mcp:0\.1\.0' "${REPO_DIR}/docker-compose.yml" ||
     fail "Compose does not pin the MCP image release"
-  grep -q 'linux/amd64,linux/arm64' "${REPO_DIR}/.github/workflows/mcp_release.yml" ||
-    fail "MCP release workflow does not build both supported architectures"
+  grep -q 'linux/amd64' "${REPO_DIR}/.github/workflows/mcp_release.yml" ||
+    fail "MCP release workflow does not build the supported architecture"
   mcp_images="$(awk '
     /^    mcp-(db-init|mailcow):/ { in_mcp_service = 1; next }
     /^    [^[:space:]]/ { in_mcp_service = 0 }
     in_mcp_service && /^[[:space:]]+image:/ { print }
   ' "${REPO_DIR}/docker-compose.yml")"
-  test "$(grep -Fc 'image: ghcr.io/mailcow/mcp:0.1.0' <<< "${mcp_images}")" = 2 ||
+  test "$(grep -cE 'image: ghcr\.io/[^/]+/mcp:0\.1\.0' <<< "${mcp_images}")" = 2 ||
     fail "both MCP services do not use the pinned MCP image release"
+  # Both MCP services must resolve to the same registry namespace. Comparing the
+  # deduplicated set against the first line avoids wc -l, whose output is padded
+  # on BSD/macOS and would not compare equal to a bare count.
+  test "$(sort -u <<< "${mcp_images}")" = "$(head -n 1 <<< "${mcp_images}")" ||
+    fail "MCP services disagree on the pinned image reference"
   ! grep -q 'image:.*latest' <<< "${mcp_images}" ||
     fail "an MCP service uses an unpinned latest image reference"
-  pass "MCP image release policy pins Compose and publishes both architectures"
+  pass "MCP image release policy pins Compose and publishes the release image"
 }
 
 [[ -x "${MCP_SCRIPT}" ]] || fail "helper-scripts/mcp.sh is absent"

@@ -329,14 +329,27 @@ docker_garbage() {
   IMGS_TO_DELETE=()
 
   declare -A IMAGES_INFO
-  COMPOSE_IMAGES=($(grep -oP "image: \K(ghcr\.io/)?mailcow.+" "${SCRIPT_DIR}/docker-compose.yml"))
+  # Match any registry namespace the compose file uses - upstream ghcr.io/mailcow,
+  # a fork republishing under ghcr.io/<owner>, or the legacy bare mailcow/ names -
+  # so forks still get their superseded image tags cleaned up.
+  COMPOSE_IMAGES=($(grep -oP "image: \K((ghcr\.io/[^/]+/)|mailcow/)[^[:space:]]+" "${SCRIPT_DIR}/docker-compose.yml"))
 
-  for existing_image in $(docker images --format "{{.ID}}:{{.Repository}}:{{.Tag}}" | grep -E '(mailcow/|ghcr\.io/mailcow/)'); do
+  [[ -z ${COMPOSE_IMAGES[*]} ]] && return 0
+
+  # Only ever consider repositories the compose file actually references, so an
+  # unrelated image sharing the fork's namespace is never swept up.
+  COMPOSE_REPOS=($(printf '%s\n' "${COMPOSE_IMAGES[@]}" | sed 's|:[^:]*$||' | sort -u))
+
+  for existing_image in $(docker images --format "{{.ID}}:{{.Repository}}:{{.Tag}}"); do
       ID=$(echo "$existing_image" | cut -d ':' -f 1)
       REPOSITORY=$(echo "$existing_image" | cut -d ':' -f 2)
       TAG=$(echo "$existing_image" | cut -d ':' -f 3)
 
-      if [[ "$REPOSITORY" == "mailcow/backup" || "$REPOSITORY" == "ghcr.io/mailcow/backup" ]]; then
+      if [[ ! " ${COMPOSE_REPOS[*]} " =~ " ${REPOSITORY} " ]]; then
+          continue
+      fi
+
+      if [[ "$REPOSITORY" == "mailcow/backup" || "$REPOSITORY" == */backup ]]; then
           if [[ "$TAG" != "<none>" ]]; then
               continue
           fi
